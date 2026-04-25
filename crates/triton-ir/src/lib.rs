@@ -31,6 +31,7 @@ pub mod attr;
 pub mod dialect;
 pub mod module;
 pub mod op;
+pub mod ops;
 pub mod printer;
 pub mod ty;
 pub mod value;

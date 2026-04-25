@@ -16,7 +16,8 @@
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
-    spanned::Spanned, Block, Expr, ExprCall, FnArg, ItemFn, Local, Pat, PathArguments, Stmt, Type,
+    spanned::Spanned, BinOp, Block, Expr, ExprBinary, ExprCall, FnArg, ItemFn, Local, Pat,
+    PathArguments, Stmt, Type,
 };
 
 /// Top-level expansion entry point.
@@ -249,6 +250,7 @@ fn translate_expr(
 ) -> Result<TranslatedExpr, syn::Error> {
     match expr {
         Expr::Call(call) => translate_call(call, hoist, counter),
+        Expr::Binary(b) => translate_binop(b, hoist, counter),
         // Variable references appear at every use site. `triton_ir::Value`
         // is `Clone` but not `Copy`, so emit an explicit `.clone()` at every
         // reference. Cloning a Value is cheap (one Type box for tensors,
@@ -268,9 +270,79 @@ fn translate_expr(
         other => Err(syn::Error::new(
             other.span(),
             "this expression form is not yet supported inside #[triton_kernel] bodies \
-             (Phase 3.3 step 1 supports: function calls, variable refs, integer literals)",
+             (supported: function calls, binary ops `+ - * < <= > >= == !=`, \
+             variable refs, integer literals)",
         )),
     }
+}
+
+/// Wrap an emitted value-producing expression in a hoisting `let __tmp = ...;`
+/// if the caller wants the result as a sub-expression of an outer call (which
+/// would otherwise mut-borrow `__triton_f` simultaneously). Top-level callers
+/// pass `hoist = false` because the surrounding `let pat = ...;` (or
+/// `expr;` statement) already releases the borrow at the semicolon.
+fn maybe_hoist(
+    mut setup: Vec<TokenStream2>,
+    expr: TokenStream2,
+    kind: CallKind,
+    hoist: bool,
+    counter: &mut u32,
+) -> TranslatedExpr {
+    if hoist && matches!(kind, CallKind::Value) {
+        let tmp = format_ident!("__triton_tmp_{}", *counter);
+        *counter += 1;
+        setup.push(quote! { let #tmp = #expr; });
+        TranslatedExpr {
+            setup,
+            expr: quote! { #tmp },
+        }
+    } else {
+        TranslatedExpr { setup, expr }
+    }
+}
+
+/// Translate `a OP b` into a call into `triton_ir::ops::*`, which dispatches
+/// on the runtime type of `a` to pick the right MLIR op (e.g. `+` becomes
+/// `tt.addptr` for pointer-typed lhs, `arith.addf` for float, otherwise
+/// `arith.addi`). Operands are recursively translated and force-hoisted so
+/// nested binary expressions don't trigger borrow-checker conflicts.
+fn translate_binop(
+    node: &ExprBinary,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    let lt = translate_expr(&node.left, /*hoist=*/ true, counter)?;
+    let rt = translate_expr(&node.right, /*hoist=*/ true, counter)?;
+
+    let mut setup = lt.setup;
+    setup.extend(rt.setup);
+    let l = lt.expr;
+    let r = rt.expr;
+
+    let dispatch_fn = match node.op {
+        BinOp::Add(_) => quote! { ::triton_ir::ops::add },
+        BinOp::Sub(_) => quote! { ::triton_ir::ops::sub },
+        BinOp::Mul(_) => quote! { ::triton_ir::ops::mul },
+        BinOp::Lt(_) => quote! { ::triton_ir::ops::lt },
+        BinOp::Le(_) => quote! { ::triton_ir::ops::le },
+        BinOp::Gt(_) => quote! { ::triton_ir::ops::gt },
+        BinOp::Ge(_) => quote! { ::triton_ir::ops::ge },
+        BinOp::Eq(_) => quote! { ::triton_ir::ops::eq },
+        BinOp::Ne(_) => quote! { ::triton_ir::ops::ne },
+        other => {
+            return Err(syn::Error::new(
+                node.op.span(),
+                format!(
+                    "binary operator `{:?}` is not supported in #[triton_kernel] body \
+                     (supported: `+ - * < <= > >= == !=`)",
+                    other
+                ),
+            ));
+        }
+    };
+
+    let call_expr = quote! { #dispatch_fn(&mut __triton_f, #l, #r) };
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
 }
 
 fn translate_call(
@@ -296,21 +368,7 @@ fn translate_call(
         CallKind::Void => quote! { __triton_f.op_void(#spec_expr) },
     };
 
-    // Hoist value-producing calls used as sub-expressions into named temps.
-    if hoist && matches!(kind, CallKind::Value) {
-        let tmp = format_ident!("__triton_tmp_{}", *counter);
-        *counter += 1;
-        setup.push(quote! { let #tmp = #call_expr; });
-        Ok(TranslatedExpr {
-            setup,
-            expr: quote! { #tmp },
-        })
-    } else {
-        Ok(TranslatedExpr {
-            setup,
-            expr: call_expr,
-        })
-    }
+    Ok(maybe_hoist(setup, call_expr, kind, hoist, counter))
 }
 
 fn call_name(call: &ExprCall) -> Result<String, syn::Error> {
