@@ -34,6 +34,7 @@ impl Module {
             return_types: Vec::new(),
             body: Region::new(),
             counter: SsaCounter::new(),
+            region_stack: Vec::new(),
             committed: false,
         }
     }
@@ -75,6 +76,13 @@ pub struct Func {
 }
 
 /// Authoring-time builder for a function body.
+///
+/// `region_stack` makes [`Self::op`] / [`Self::op_one`] / [`Self::op_void`]
+/// context-aware: when empty, ops append to the function body; when
+/// non-empty, ops go to the top region (the body of the most-recently
+/// entered region-having op like `scf.for`). This lets [`Self::for_loop_with`]
+/// expose a closure-based API where the user writes the loop body using the
+/// same `op_one` calls as outside the loop.
 pub struct FuncBuilder<'m> {
     module: &'m mut Module,
     name: String,
@@ -83,6 +91,7 @@ pub struct FuncBuilder<'m> {
     return_types: Vec<Type>,
     body: Region,
     counter: SsaCounter,
+    region_stack: Vec<Region>,
     committed: bool,
 }
 
@@ -112,18 +121,25 @@ impl<'m> FuncBuilder<'m> {
         self
     }
 
-    /// Append an op described by `spec` to the entry block. Allocates fresh
-    /// SSA values for each declared result type and returns them.
+    /// Append an op described by `spec` to the **current** target region —
+    /// which is the topmost entry on `region_stack` if any, otherwise the
+    /// function body. Allocates fresh SSA values for each declared result
+    /// type and returns them.
     pub fn op(&mut self, spec: OpSpec) -> Vec<Value> {
         let results: Vec<Value> = spec
             .result_types
             .iter()
             .map(|t| self.counter.fresh(t.clone()))
             .collect();
-        if self.body.blocks.is_empty() {
-            self.body.blocks.push(Block::new());
+        let target_region: &mut Region = if let Some(top) = self.region_stack.last_mut() {
+            top
+        } else {
+            &mut self.body
+        };
+        if target_region.blocks.is_empty() {
+            target_region.blocks.push(Block::new());
         }
-        self.body.blocks[0].ops.push(Op {
+        target_region.blocks[0].ops.push(Op {
             name: spec.name,
             operands: spec.operands,
             results: results.clone(),
@@ -208,6 +224,111 @@ impl<'m> FuncBuilder<'m> {
     pub fn append_to_region_void(&mut self, region: &mut Region, spec: OpSpec) {
         let r = self.append_to_region(region, spec);
         assert!(r.is_empty(), "append_to_region_void called on op with {} results", r.len());
+    }
+
+    /// High-level `scf.for` construction. Pushes a fresh region for the loop
+    /// body, runs `body_fn` (which can use `self.op_one` etc. — those calls
+    /// will land in the loop body, not the function body), appends an
+    /// `scf.yield` of the values returned by the closure, then pops the
+    /// region and constructs the `scf.for` op.
+    ///
+    /// `lb`, `ub`, `step` must share the same scalar integer type (typically
+    /// `i32`); the loop induction variable will have that same type.
+    /// `iter_args` is the list of values threaded through the loop. The
+    /// closure receives the induction variable and a snapshot of the
+    /// iter_args bound to the entry block of the body region; it must
+    /// return a `Vec<Value>` of matching length (these become the
+    /// `scf.yield` operands).
+    ///
+    /// Nested `for_loop_with` calls work transparently — the region stack
+    /// keeps track.
+    pub fn for_loop_with<F>(
+        &mut self,
+        lb: Value,
+        ub: Value,
+        step: Value,
+        iter_args: Vec<Value>,
+        body_fn: F,
+    ) -> Vec<Value>
+    where
+        F: FnOnce(&mut FuncBuilder<'m>, Value, Vec<Value>) -> Vec<Value>,
+    {
+        // Allocate entry-block SSA values for the induction var + iter_args
+        // viewed from inside the body.
+        let induction_ty = lb.ty().clone();
+        let body_induction = self.counter.fresh(induction_ty);
+        let body_iter_args: Vec<Value> = iter_args
+            .iter()
+            .map(|v| self.counter.fresh(v.ty().clone()))
+            .collect();
+
+        // Build the entry block carrying (induction, iter_args...) as args.
+        let mut entry_block_args = vec![body_induction.clone()];
+        entry_block_args.extend(body_iter_args.iter().cloned());
+        let region = Region {
+            blocks: vec![Block::with_args(entry_block_args)],
+        };
+
+        // Push, run body, append scf.yield, pop.
+        self.region_stack.push(region);
+        let yield_values = body_fn(self, body_induction, body_iter_args);
+        self.op_void(crate::dialect::scf::yield_(yield_values));
+        let body_region = self
+            .region_stack
+            .pop()
+            .expect("for_loop_with stack underflow — region was popped twice");
+
+        // Construct the scf.for op and append it to the outer region.
+        self.op(crate::dialect::scf::for_loop(
+            lb, ub, step, iter_args, body_region,
+        ))
+    }
+
+    // ── DSL helper methods (delegate to crate::ops) ────────────────────
+    //
+    // These exist as inherent methods so the proc-macro can emit
+    // `__triton_f.add(a, b)` and Rust's method-call auto-reborrow handles
+    // both scopes — top-level where __triton_f is a FuncBuilder value, and
+    // closure bodies where __triton_f is `&mut FuncBuilder`. Free
+    // `crate::ops::add(&mut __triton_f, ...)` would need explicit reborrow
+    // at every call site inside a closure (`&mut *__triton_f`), which we'd
+    // rather not bake into the proc-macro's emit code paths.
+
+    /// Type-dispatched `+`. See [`crate::ops::add`].
+    pub fn add(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::add(self, a, b)
+    }
+    /// Type-dispatched `-`. See [`crate::ops::sub`].
+    pub fn sub(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::sub(self, a, b)
+    }
+    /// Type-dispatched `*`. See [`crate::ops::mul`].
+    pub fn mul(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::mul(self, a, b)
+    }
+    /// Type-dispatched `<`. See [`crate::ops::lt`].
+    pub fn lt(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::lt(self, a, b)
+    }
+    /// Type-dispatched `<=`. See [`crate::ops::le`].
+    pub fn le(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::le(self, a, b)
+    }
+    /// Type-dispatched `>`. See [`crate::ops::gt`].
+    pub fn gt(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::gt(self, a, b)
+    }
+    /// Type-dispatched `>=`. See [`crate::ops::ge`].
+    pub fn ge(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::ge(self, a, b)
+    }
+    /// Type-dispatched `==`. See [`crate::ops::eq`].
+    pub fn eq(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::eq(self, a, b)
+    }
+    /// Type-dispatched `!=`. See [`crate::ops::ne`].
+    pub fn ne(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::ne(self, a, b)
     }
 
     /// Commit the function to its parent module.

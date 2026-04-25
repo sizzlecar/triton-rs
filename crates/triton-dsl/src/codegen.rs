@@ -16,8 +16,8 @@
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
-    spanned::Spanned, BinOp, Block, Expr, ExprBinary, ExprCall, FnArg, ItemFn, Local, Pat,
-    PathArguments, Stmt, Type,
+    spanned::Spanned, BinOp, Block, Expr, ExprBinary, ExprCall, ExprClosure, FnArg, ItemFn, Local,
+    Pat, PathArguments, Stmt, Type,
 };
 
 /// Top-level expansion entry point.
@@ -319,16 +319,21 @@ fn translate_binop(
     let l = lt.expr;
     let r = rt.expr;
 
-    let dispatch_fn = match node.op {
-        BinOp::Add(_) => quote! { ::triton_ir::ops::add },
-        BinOp::Sub(_) => quote! { ::triton_ir::ops::sub },
-        BinOp::Mul(_) => quote! { ::triton_ir::ops::mul },
-        BinOp::Lt(_) => quote! { ::triton_ir::ops::lt },
-        BinOp::Le(_) => quote! { ::triton_ir::ops::le },
-        BinOp::Gt(_) => quote! { ::triton_ir::ops::gt },
-        BinOp::Ge(_) => quote! { ::triton_ir::ops::ge },
-        BinOp::Eq(_) => quote! { ::triton_ir::ops::eq },
-        BinOp::Ne(_) => quote! { ::triton_ir::ops::ne },
+    // Emit as a method call on __triton_f so Rust's method-call
+    // auto-reborrow handles both contexts: top-level FuncBuilder values
+    // and closure-parameter `&mut FuncBuilder` references inside scf_for
+    // bodies. Free-function dispatch (ops::add(&mut __triton_f, ...))
+    // would type-mismatch in the closure context.
+    let method = match node.op {
+        BinOp::Add(_) => quote! { add },
+        BinOp::Sub(_) => quote! { sub },
+        BinOp::Mul(_) => quote! { mul },
+        BinOp::Lt(_) => quote! { lt },
+        BinOp::Le(_) => quote! { le },
+        BinOp::Gt(_) => quote! { gt },
+        BinOp::Ge(_) => quote! { ge },
+        BinOp::Eq(_) => quote! { eq },
+        BinOp::Ne(_) => quote! { ne },
         other => {
             return Err(syn::Error::new(
                 node.op.span(),
@@ -341,7 +346,7 @@ fn translate_binop(
         }
     };
 
-    let call_expr = quote! { #dispatch_fn(&mut __triton_f, #l, #r) };
+    let call_expr = quote! { __triton_f.#method(#l, #r) };
     Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
 }
 
@@ -350,6 +355,16 @@ fn translate_call(
     hoist: bool,
     counter: &mut u32,
 ) -> Result<TranslatedExpr, syn::Error> {
+    // Special forms with arity > 1 and a closure tail get handled before the
+    // generic translation path, since their final arg can't be evaluated
+    // eagerly into a temp like a plain Value.
+    let early_name = call_name(call).ok();
+    if let Some(n) = early_name.as_deref() {
+        if n == "scf_for" {
+            return translate_scf_for(call, hoist, counter);
+        }
+    }
+
     // Args to a call are always evaluated to a temporary first to avoid
     // multiple simultaneous mut borrows of __triton_f.
     let mut setup = Vec::new();
@@ -369,6 +384,151 @@ fn translate_call(
     };
 
     Ok(maybe_hoist(setup, call_expr, kind, hoist, counter))
+}
+
+/// Translate `scf_for(lb, ub, step, init, |i, acc| body)` into a call to
+/// `__triton_f.for_loop_with(...)`. The closure body is translated with the
+/// same machinery as the outer body — ops emitted via `__triton_f.op_one`
+/// land in the loop region thanks to FuncBuilder's region_stack routing.
+fn translate_scf_for(
+    call: &ExprCall,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    if call.args.len() != 5 {
+        return Err(syn::Error::new(
+            call.span(),
+            "`scf_for` expects 5 arguments: lb, ub, step, init, |i, acc| body",
+        ));
+    }
+
+    // Translate the four leading scalar/Value args normally — force-hoist
+    // each into a temp so they evaluate before the closure runs.
+    let lb_t = translate_expr(&call.args[0], /*hoist=*/ true, counter)?;
+    let ub_t = translate_expr(&call.args[1], /*hoist=*/ true, counter)?;
+    let step_t = translate_expr(&call.args[2], /*hoist=*/ true, counter)?;
+    let init_t = translate_expr(&call.args[3], /*hoist=*/ true, counter)?;
+    let mut setup = Vec::new();
+    setup.extend(lb_t.setup);
+    setup.extend(ub_t.setup);
+    setup.extend(step_t.setup);
+    setup.extend(init_t.setup);
+    let lb = lb_t.expr;
+    let ub = ub_t.expr;
+    let step = step_t.expr;
+    let init = init_t.expr;
+
+    // Final arg must be a closure with exactly two parameters.
+    let closure: &ExprClosure = match &call.args[4] {
+        Expr::Closure(c) => c,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "scf_for: 5th argument must be a closure `|i, acc| { ... }`",
+            ));
+        }
+    };
+    if closure.inputs.len() != 2 {
+        return Err(syn::Error::new(
+            closure.span(),
+            "scf_for closure must take exactly 2 parameters: |induction, iter_arg|",
+        ));
+    }
+    let i_ident = closure_param_ident(&closure.inputs[0])?;
+    let acc_ident = closure_param_ident(&closure.inputs[1])?;
+
+    // The closure body can be a block `{ stmts; trailing_expr }` or a bare
+    // expression (when the user writes `|i, acc| acc + i`). Treat the bare-
+    // expression form as a body with no preceding statements, just a yield.
+    let (init_stmts, yield_t) = match &*closure.body {
+        Expr::Block(eb) => {
+            let (init, yield_expr) = split_block_for_yield(&eb.block, counter)?;
+            let y = translate_expr(yield_expr, /*hoist=*/ false, counter)?;
+            (init, y)
+        }
+        other => {
+            // No setup statements — the entire body IS the yield expression.
+            (Vec::new(), translate_expr(other, /*hoist=*/ false, counter)?)
+        }
+    };
+    let yield_setup = yield_t.setup;
+    let yield_expr_ts = yield_t.expr;
+
+    // Assemble the closure body: bind the closure's user-named params to
+    // the scf.for entry-block args, then run the user body, then yield.
+    let closure_body = quote! {
+        let #i_ident = __triton_i;
+        let #acc_ident = __triton_iter_args[0].clone();
+        #(#init_stmts)*
+        #(#yield_setup)*
+        let __triton_yield = #yield_expr_ts;
+        ::std::vec![__triton_yield]
+    };
+
+    let call_expr = quote! {
+        {
+            let __triton_results = __triton_f.for_loop_with(
+                #lb, #ub, #step,
+                ::std::vec![#init],
+                |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>,
+                 __triton_i: ::triton_ir::value::Value,
+                 __triton_iter_args: ::std::vec::Vec<::triton_ir::value::Value>|
+                 -> ::std::vec::Vec<::triton_ir::value::Value> {
+                    #closure_body
+                },
+            );
+            __triton_results.into_iter().next()
+                .expect("scf_for must yield exactly one iter_arg result")
+        }
+    };
+
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
+}
+
+/// Pull a plain identifier out of a closure parameter pattern. The DSL only
+/// supports `|name|` style — destructuring patterns get a clearer error
+/// than the generic translator would emit.
+fn closure_param_ident(pat: &Pat) -> Result<proc_macro2::Ident, syn::Error> {
+    match pat {
+        Pat::Ident(p) => Ok(p.ident.clone()),
+        Pat::Type(pt) => closure_param_ident(&pt.pat),
+        other => Err(syn::Error::new(
+            other.span(),
+            "scf_for closure parameters must be plain identifiers (no destructuring)",
+        )),
+    }
+}
+
+/// Split a closure body into (statements before yield, yield expression).
+/// Insists on a trailing expression with no semicolon — that's the value
+/// flowing through `scf.yield`.
+fn split_block_for_yield<'b>(
+    block: &'b Block,
+    counter: &mut u32,
+) -> Result<(Vec<TokenStream2>, &'b Expr), syn::Error> {
+    if block.stmts.is_empty() {
+        return Err(syn::Error::new(
+            block.span(),
+            "scf_for body cannot be empty — it must yield a value as its trailing expression",
+        ));
+    }
+    let last_idx = block.stmts.len() - 1;
+    let yield_expr = match &block.stmts[last_idx] {
+        Stmt::Expr(e, None) => e,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "scf_for body must end with a trailing expression (no semicolon) \
+                 that yields the next iter_arg",
+            ));
+        }
+    };
+
+    let mut init = Vec::with_capacity(last_idx);
+    for stmt in &block.stmts[..last_idx] {
+        init.push(translate_stmt(stmt, counter)?);
+    }
+    Ok((init, yield_expr))
 }
 
 fn call_name(call: &ExprCall) -> Result<String, syn::Error> {

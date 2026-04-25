@@ -57,3 +57,40 @@ fn scf_for_prints_block_args_and_yield() {
         "scf.for type signature should be (lb, ub, step, init) -> acc_result:\n{text}"
     );
 }
+
+/// Same kernel built with the closure-based `for_loop_with` API. Should
+/// produce structurally equivalent MLIR (same op set, same types).
+fn build_sum_loop_via_closure() -> Module {
+    let mut m = Module::new();
+    let mut f = m.func("sum_via_closure");
+    let out_ptr = f.arg("out", Type::ptr(Type::i32()));
+
+    let c0 = f.op_one(arith::constant_i32(0));
+    let c1 = f.op_one(arith::constant_i32(1));
+    let c10 = f.op_one(arith::constant_i32(10));
+
+    let results = f.for_loop_with(c0.clone(), c10, c1, vec![c0], |fb, i, accs| {
+        let acc = accs[0].clone();
+        // op_one on `fb` here lands in the loop body region thanks to
+        // region_stack — no special API required.
+        let new_acc = fb.op_one(arith::addi(acc, i));
+        vec![new_acc]
+    });
+    let result = results.into_iter().next().unwrap();
+
+    f.op_void(tt::store(out_ptr, result, None));
+    f.op_void(tt::return_());
+    f.finish();
+    m
+}
+
+#[test]
+fn for_loop_with_closure_yields_same_structure() {
+    let m = build_sum_loop_via_closure();
+    let text = m.to_string();
+    eprintln!("===== sum_via_closure MLIR =====\n{text}\n================================");
+    assert!(text.contains("\"scf.for\""));
+    assert!(text.contains("\"scf.yield\""));
+    assert!(text.contains("^bb0("));
+    assert!(text.contains("(i32, i32, i32, i32) -> i32"));
+}
