@@ -138,3 +138,101 @@ pub fn cmpi(pred: CmpiPred, lhs: Value, rhs: Value) -> OpSpec {
         .with_result(result_ty)
         .with_attr("predicate", Attr::Int(pred.as_i64(), Type::I64))
 }
+
+// ── float arith ─────────────────────────────────────────────────────────
+
+/// `arith.subf` — float subtract.
+pub fn subf(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.subf")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.divf` — float divide.
+pub fn divf(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.divf")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// Float comparison predicates accepted by `arith.cmpf`. Codes match
+/// MLIR's `arith::CmpFPredicate` enum. Prefer the ordered variants
+/// (`Oeq`, `Olt`, ...) for kernel comparisons unless you specifically
+/// need NaN-tolerant semantics.
+#[derive(Debug, Clone, Copy)]
+pub enum CmpfPred {
+    /// always false
+    AlwaysFalse,
+    /// ordered equal
+    Oeq,
+    /// ordered greater than
+    Ogt,
+    /// ordered greater or equal
+    Oge,
+    /// ordered less than
+    Olt,
+    /// ordered less or equal
+    Ole,
+    /// ordered not equal
+    One,
+    /// ordered (no NaN)
+    Ord,
+    /// unordered equal
+    Ueq,
+    /// unordered greater than
+    Ugt,
+    /// unordered greater or equal
+    Uge,
+    /// unordered less than
+    Ult,
+    /// unordered less or equal
+    Ule,
+    /// unordered not equal
+    Une,
+    /// unordered (any NaN)
+    Uno,
+    /// always true
+    AlwaysTrue,
+}
+
+impl CmpfPred {
+    /// MLIR enum integer (matches `arith::CmpFPredicate` order).
+    pub fn as_i64(&self) -> i64 {
+        match self {
+            CmpfPred::AlwaysFalse => 0,
+            CmpfPred::Oeq => 1,
+            CmpfPred::Ogt => 2,
+            CmpfPred::Oge => 3,
+            CmpfPred::Olt => 4,
+            CmpfPred::Ole => 5,
+            CmpfPred::One => 6,
+            CmpfPred::Ord => 7,
+            CmpfPred::Ueq => 8,
+            CmpfPred::Ugt => 9,
+            CmpfPred::Uge => 10,
+            CmpfPred::Ult => 11,
+            CmpfPred::Ule => 12,
+            CmpfPred::Une => 13,
+            CmpfPred::Uno => 14,
+            CmpfPred::AlwaysTrue => 15,
+        }
+    }
+}
+
+/// `arith.cmpf predicate, %lhs, %rhs : T` — element-wise float comparison.
+/// Result type is `i1` for scalar inputs, `tensor<...xi1>` for tensor inputs.
+pub fn cmpf(pred: CmpfPred, lhs: Value, rhs: Value) -> OpSpec {
+    let result_ty = match lhs.ty() {
+        Type::Tensor { shape, .. } => Type::tensor(shape.clone(), Type::I1),
+        _ => Type::I1,
+    };
+    OpSpec::new("arith.cmpf")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(result_ty)
+        .with_attr("predicate", Attr::Int(pred.as_i64(), Type::I64))
+}

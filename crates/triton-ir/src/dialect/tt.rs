@@ -196,3 +196,10 @@ pub fn reshape(input: Value, new_shape: Vec<i64>) -> OpSpec {
         .with_operand(input)
         .with_result(Type::tensor(new_shape, elem_ty))
 }
+
+/// `tt.reduce.return` — terminator for the reduction body region. Always
+/// `void`; the body's combined value flows through this op back into the
+/// enclosing `tt.reduce`.
+pub fn reduce_return(value: Value) -> OpSpec {
+    OpSpec::new("tt.reduce.return").with_operand(value)
+}

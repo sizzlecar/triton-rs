@@ -328,6 +328,7 @@ fn translate_binop(
         BinOp::Add(_) => quote! { add },
         BinOp::Sub(_) => quote! { sub },
         BinOp::Mul(_) => quote! { mul },
+        BinOp::Div(_) => quote! { div },
         BinOp::Lt(_) => quote! { lt },
         BinOp::Le(_) => quote! { le },
         BinOp::Gt(_) => quote! { gt },
@@ -339,7 +340,7 @@ fn translate_binop(
                 node.op.span(),
                 format!(
                     "binary operator `{:?}` is not supported in #[triton_kernel] body \
-                     (supported: `+ - * < <= > >= == !=`)",
+                     (supported: `+ - * / < <= > >= == !=`)",
                     other
                 ),
             ));
@@ -362,6 +363,9 @@ fn translate_call(
     if let Some(n) = early_name.as_deref() {
         if n == "scf_for" {
             return translate_scf_for(call, hoist, counter);
+        }
+        if n == "reduce" {
+            return translate_reduce(call, hoist, counter);
         }
     }
 
@@ -480,6 +484,82 @@ fn translate_scf_for(
             __triton_results.into_iter().next()
                 .expect("scf_for must yield exactly one iter_arg result")
         }
+    };
+
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
+}
+
+/// Translate `reduce(input, axis, |a, b| body)` into a call to
+/// `__triton_f.reduce_with(...)`. Closure body has the same shape as
+/// scf_for's: optional setup statements followed by a trailing yield expr.
+fn translate_reduce(
+    call: &ExprCall,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    if call.args.len() != 3 {
+        return Err(syn::Error::new(
+            call.span(),
+            "`reduce` expects 3 arguments: input, axis, |a, b| body",
+        ));
+    }
+
+    let input_t = translate_expr(&call.args[0], /*hoist=*/ true, counter)?;
+    let axis_t = translate_expr(&call.args[1], /*hoist=*/ false, counter)?;
+    let mut setup = Vec::new();
+    setup.extend(input_t.setup);
+    setup.extend(axis_t.setup);
+    let input_e = input_t.expr;
+    let axis_e = axis_t.expr;
+
+    let closure: &ExprClosure = match &call.args[2] {
+        Expr::Closure(c) => c,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "reduce: 3rd argument must be a closure `|a, b| { ... }`",
+            ));
+        }
+    };
+    if closure.inputs.len() != 2 {
+        return Err(syn::Error::new(
+            closure.span(),
+            "reduce closure must take exactly 2 parameters: |lhs, rhs|",
+        ));
+    }
+    let lhs_ident = closure_param_ident(&closure.inputs[0])?;
+    let rhs_ident = closure_param_ident(&closure.inputs[1])?;
+
+    let (init_stmts, yield_t) = match &*closure.body {
+        Expr::Block(eb) => {
+            let (init, yield_expr) = split_block_for_yield(&eb.block, counter)?;
+            let y = translate_expr(yield_expr, /*hoist=*/ false, counter)?;
+            (init, y)
+        }
+        other => (Vec::new(), translate_expr(other, /*hoist=*/ false, counter)?),
+    };
+    let yield_setup = yield_t.setup;
+    let yield_expr_ts = yield_t.expr;
+
+    let closure_body = quote! {
+        let #lhs_ident = __triton_lhs;
+        let #rhs_ident = __triton_rhs;
+        #(#init_stmts)*
+        #(#yield_setup)*
+        #yield_expr_ts
+    };
+
+    let call_expr = quote! {
+        __triton_f.reduce_with(
+            #input_e,
+            #axis_e,
+            |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>,
+             __triton_lhs: ::triton_ir::value::Value,
+             __triton_rhs: ::triton_ir::value::Value|
+             -> ::triton_ir::value::Value {
+                #closure_body
+            },
+        )
     };
 
     Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))

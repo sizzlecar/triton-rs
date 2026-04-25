@@ -15,7 +15,7 @@
 //! "elementwise" semantics for arith ops.
 
 use crate::dialect::{arith, tt};
-use crate::dialect::arith::CmpiPred;
+use crate::dialect::arith::{CmpfPred, CmpiPred};
 use crate::module::FuncBuilder;
 use crate::ty::Type;
 use crate::value::Value;
@@ -56,20 +56,16 @@ pub fn add(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
     }
 }
 
-/// `a - b`. Dispatches between `arith.subi` (integer) and... well, we don't
-/// have `arith.subf` exposed yet, so floats currently error out clearly
-/// rather than silently emit the wrong op.
+/// `a - b`. Dispatches between `arith.subi` (integer) and `arith.subf`.
 pub fn sub(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    if is_float(a.ty()) {
-        panic!(
-            "ops::sub on float types not yet supported (subf TBD); got {}",
-            a.ty()
-        );
-    }
     if is_ptr_like(a.ty()) {
         panic!("ops::sub on pointer types is not meaningful; use addptr with a negated offset");
     }
-    f.op_one(arith::subi(a, b))
+    if is_float(a.ty()) {
+        f.op_one(arith::subf(a, b))
+    } else {
+        f.op_one(arith::subi(a, b))
+    }
 }
 
 /// `a * b`. Dispatches between `arith.muli` and `arith.mulf`.
@@ -84,43 +80,59 @@ pub fn mul(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
     }
 }
 
-// ── comparison (integer only for now; cmpf TBD) ─────────────────────────
-
-fn cmpi(f: &mut FuncBuilder<'_>, pred: CmpiPred, a: Value, b: Value) -> Value {
-    if is_float(a.ty()) {
-        panic!(
-            "ops::cmp on float types requires arith.cmpf which is not yet wrapped \
-             (got {})",
-            a.ty()
-        );
+/// `a / b`. Dispatches between `arith.divsi` (signed integer) and
+/// `arith.divf` (float).
+pub fn div(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    if is_ptr_like(a.ty()) {
+        panic!("ops::div on pointer types is not meaningful; got {}", a.ty());
     }
+    if is_float(a.ty()) {
+        f.op_one(arith::divf(a, b))
+    } else {
+        f.op_one(arith::divsi(a, b))
+    }
+}
+
+// ── comparison (int + float) ────────────────────────────────────────────
+
+fn cmp(
+    f: &mut FuncBuilder<'_>,
+    int_pred: CmpiPred,
+    flt_pred: CmpfPred,
+    a: Value,
+    b: Value,
+) -> Value {
     if is_ptr_like(a.ty()) {
         panic!("ops::cmp on pointer types is not meaningful; got {}", a.ty());
     }
-    f.op_one(arith::cmpi(pred, a, b))
+    if is_float(a.ty()) {
+        f.op_one(arith::cmpf(flt_pred, a, b))
+    } else {
+        f.op_one(arith::cmpi(int_pred, a, b))
+    }
 }
 
-/// `a < b` (signed less-than).
+/// `a < b`. Ordered float compare for floats; signed less-than for ints.
 pub fn lt(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    cmpi(f, CmpiPred::Slt, a, b)
+    cmp(f, CmpiPred::Slt, CmpfPred::Olt, a, b)
 }
-/// `a <= b` (signed less-or-equal).
+/// `a <= b`.
 pub fn le(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    cmpi(f, CmpiPred::Sle, a, b)
+    cmp(f, CmpiPred::Sle, CmpfPred::Ole, a, b)
 }
-/// `a > b` (signed greater-than).
+/// `a > b`.
 pub fn gt(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    cmpi(f, CmpiPred::Sgt, a, b)
+    cmp(f, CmpiPred::Sgt, CmpfPred::Ogt, a, b)
 }
-/// `a >= b` (signed greater-or-equal).
+/// `a >= b`.
 pub fn ge(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    cmpi(f, CmpiPred::Sge, a, b)
+    cmp(f, CmpiPred::Sge, CmpfPred::Oge, a, b)
 }
 /// `a == b`.
 pub fn eq(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    cmpi(f, CmpiPred::Eq, a, b)
+    cmp(f, CmpiPred::Eq, CmpfPred::Oeq, a, b)
 }
 /// `a != b`.
 pub fn ne(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
-    cmpi(f, CmpiPred::Ne, a, b)
+    cmp(f, CmpiPred::Ne, CmpfPred::One, a, b)
 }

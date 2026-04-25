@@ -284,6 +284,64 @@ impl<'m> FuncBuilder<'m> {
         ))
     }
 
+    /// High-level `tt.reduce` construction. Pushes a fresh region for the
+    /// reducer body, runs `body_fn(lhs, rhs)` to produce the combined value,
+    /// appends a `tt.reduce.return`, then pops and constructs the
+    /// `tt.reduce` op against the outer region.
+    ///
+    /// `axis` is the dimension being reduced (negative axes count from the
+    /// back). The result type drops that dimension from `input`'s shape;
+    /// when only one dim remains and it's the reduced one, the result
+    /// becomes a scalar (the element type).
+    pub fn reduce_with<F>(&mut self, input: Value, axis: i32, body_fn: F) -> Value
+    where
+        F: FnOnce(&mut FuncBuilder<'m>, Value, Value) -> Value,
+    {
+        let (in_shape, elem_ty) = match input.ty() {
+            Type::Tensor { shape, elem } => (shape.clone(), (**elem).clone()),
+            other => panic!("tt.reduce expected a tensor input, got {}", other),
+        };
+
+        // Body region: entry block has 2 args (lhs, rhs), both elem type.
+        let lhs = self.counter.fresh(elem_ty.clone());
+        let rhs = self.counter.fresh(elem_ty.clone());
+        let region = Region {
+            blocks: vec![Block::with_args(vec![lhs.clone(), rhs.clone()])],
+        };
+
+        self.region_stack.push(region);
+        let yielded = body_fn(self, lhs, rhs);
+        self.op_void(crate::dialect::tt::reduce_return(yielded));
+        let body_region = self
+            .region_stack
+            .pop()
+            .expect("reduce_with stack underflow");
+
+        // Compute result shape by dropping the reduced axis.
+        let rank = in_shape.len() as i32;
+        let axis_idx = if axis < 0 {
+            (rank + axis) as usize
+        } else {
+            axis as usize
+        };
+        let mut out_shape = in_shape;
+        out_shape.remove(axis_idx);
+        let result_ty = if out_shape.is_empty() {
+            elem_ty
+        } else {
+            Type::tensor(out_shape, elem_ty)
+        };
+
+        let results = self.op(
+            OpSpec::new("tt.reduce")
+                .with_operand(input)
+                .with_result(result_ty)
+                .with_attr("axis", crate::attr::Attr::i32(axis))
+                .with_region(body_region),
+        );
+        results.into_iter().next().expect("tt.reduce produces one result")
+    }
+
     // ── DSL helper methods (delegate to crate::ops) ────────────────────
     //
     // These exist as inherent methods so the proc-macro can emit
@@ -305,6 +363,10 @@ impl<'m> FuncBuilder<'m> {
     /// Type-dispatched `*`. See [`crate::ops::mul`].
     pub fn mul(&mut self, a: Value, b: Value) -> Value {
         crate::ops::mul(self, a, b)
+    }
+    /// Type-dispatched `/`. See [`crate::ops::div`].
+    pub fn div(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::div(self, a, b)
     }
     /// Type-dispatched `<`. See [`crate::ops::lt`].
     pub fn lt(&mut self, a: Value, b: Value) -> Value {
