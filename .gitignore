@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Vendored Triton build artifacts
+crates/triton-sys/vendor/triton/build
+crates/triton-sys/vendor/triton/python/build
+
+# bindgen output
+crates/triton-sys/src/bindings.rs
+
+# CMake artifacts
+**/CMakeFiles
+**/CMakeCache.txt
+**/cmake_install.cmake
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Local validation venv (Triton has no macOS wheel; we validate via Docker
+# instead — see tools/README.md)
+.venv-validation/

@@ -1,0 +1,18 @@
+[package]
+name = "triton-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "User-facing facade: re-exports the common triton-rs API"
+
+[features]
+default = ["cpu-emulation"]
+cpu-emulation = ["triton-runtime/cpu-emulation"]
+cuda = ["triton-runtime/cuda"]
+
+[dependencies]
+triton-ir.workspace = true
+triton-runtime.workspace = true
+triton-dsl.workspace = true

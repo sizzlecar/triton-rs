@@ -1,0 +1,27 @@
+[package]
+name = "triton-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Low-level FFI bindings to the Triton MLIR backend (vendored)"
+links = "triton_c"
+
+[features]
+# Default builds the Rust scaffolding only — no Triton C++ libs are compiled.
+# Enable `compile-triton` to actually invoke cmake on the vendored Triton source.
+# Phase 0 ships the skeleton without compiling Triton (which takes ~30 min cold).
+default = []
+compile-triton = []
+
+[dependencies]
+thiserror.workspace = true
+
+[build-dependencies]
+bindgen = { workspace = true, optional = true }
+cc      = { workspace = true, optional = true }
+cmake   = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+features = []

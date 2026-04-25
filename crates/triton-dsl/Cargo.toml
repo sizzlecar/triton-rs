@@ -1,0 +1,16 @@
+[package]
+name = "triton-dsl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "proc-macro frontend: #[triton_kernel] turns Rust into Triton MLIR"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "triton-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Device runtime: cubin loading, kernel launch, multi-backend dispatch"
+
+[features]
+# CPU emulation backend — required by CI on the GitHub free runner.
+default = ["cpu-emulation"]
+cpu-emulation = []
+cuda = ["dep:cudarc"]
+hip  = []           # Phase 5
+xpu  = []           # Phase 6
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+cudarc = { workspace = true, optional = true }
