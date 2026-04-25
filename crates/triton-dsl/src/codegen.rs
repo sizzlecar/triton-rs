@@ -249,8 +249,18 @@ fn translate_expr(
 ) -> Result<TranslatedExpr, syn::Error> {
     match expr {
         Expr::Call(call) => translate_call(call, hoist, counter),
-        // Variable references and literals pass through unchanged.
-        Expr::Path(_) | Expr::Lit(_) => Ok(TranslatedExpr {
+        // Variable references appear at every use site. `triton_ir::Value`
+        // is `Clone` but not `Copy`, so emit an explicit `.clone()` at every
+        // reference. Cloning a Value is cheap (one Type box for tensors,
+        // pure Copy for scalar types) and lets users write
+        // `load(p, mask); store(p, v, mask);` naturally without `mask` being
+        // moved into the first call.
+        Expr::Path(_) => Ok(TranslatedExpr {
+            setup: vec![],
+            expr: quote! { ::std::clone::Clone::clone(&#expr) },
+        }),
+        // Integer / float literals pass through. They're `Copy`.
+        Expr::Lit(_) => Ok(TranslatedExpr {
             setup: vec![],
             expr: quote! { #expr },
         }),
@@ -341,19 +351,78 @@ fn op_spec_for(
         ),
         "program_id" => return Err(arity_err("1")),
 
+        // load(ptrs)        : no mask
+        // load(ptrs, mask)  : with mask
         "load" if n == 1 => (
             CallKind::Value,
             quote! { ::triton_ir::dialect::tt::load(#(#args),*, ::std::option::Option::None) },
         ),
-        "load" => return Err(arity_err("1 (no mask)")),
+        "load" if n == 2 => {
+            let p = &args[0];
+            let m = &args[1];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::tt::load(
+                        #p, ::std::option::Option::Some(#m),
+                    )
+                },
+            )
+        }
+        "load" => return Err(arity_err("1 or 2 (ptrs[, mask])")),
 
+        // store(ptrs, vals)        : no mask
+        // store(ptrs, vals, mask)  : with mask
         "store" if n == 2 => (
             CallKind::Void,
             quote! {
                 ::triton_ir::dialect::tt::store(#(#args),*, ::std::option::Option::None)
             },
         ),
-        "store" => return Err(arity_err("2 (no mask)")),
+        "store" if n == 3 => {
+            let p = &args[0];
+            let v = &args[1];
+            let m = &args[2];
+            (
+                CallKind::Void,
+                quote! {
+                    ::triton_ir::dialect::tt::store(
+                        #p, #v, ::std::option::Option::Some(#m),
+                    )
+                },
+            )
+        }
+        "store" => return Err(arity_err("2 or 3 (ptrs, vals[, mask])")),
+
+        // make_range(start, end) : tensor<NxLENxi32>
+        "make_range" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::make_range(#(#args),*) },
+        ),
+        "make_range" => return Err(arity_err("2 (start, end)")),
+
+        // splat_1d(scalar, len) : tensor<LENx<scalar_type>>
+        "splat_1d" if n == 2 => {
+            let scalar = &args[0];
+            let len = &args[1];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::tt::splat(
+                        #scalar,
+                        ::std::vec![(#len) as i64],
+                    )
+                },
+            )
+        }
+        "splat_1d" => return Err(arity_err("2 (scalar, len)")),
+
+        // addptr(ptrs, offsets)
+        "addptr" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::addptr(#(#args),*) },
+        ),
+        "addptr" => return Err(arity_err("2 (ptrs, offsets)")),
 
         "return_" if n == 0 => (
             CallKind::Void,
@@ -397,6 +466,46 @@ fn op_spec_for(
         ),
         "add_i32" | "sub_i32" | "mul_i32" | "add_f32" | "mul_f32" => return Err(arity_err("2")),
 
+        // arith.cmpi with explicit predicates. Result type is i1 for scalar,
+        // tensor<...xi1> for tensor inputs (handled by the IR builder).
+        "lt_i32" if n == 2 => {
+            let a = &args[0];
+            let b = &args[1];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::arith::cmpi(
+                        ::triton_ir::dialect::arith::CmpiPred::Slt, #a, #b,
+                    )
+                },
+            )
+        }
+        "le_i32" if n == 2 => {
+            let a = &args[0];
+            let b = &args[1];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::arith::cmpi(
+                        ::triton_ir::dialect::arith::CmpiPred::Sle, #a, #b,
+                    )
+                },
+            )
+        }
+        "eq_i32" if n == 2 => {
+            let a = &args[0];
+            let b = &args[1];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::arith::cmpi(
+                        ::triton_ir::dialect::arith::CmpiPred::Eq, #a, #b,
+                    )
+                },
+            )
+        }
+        "lt_i32" | "le_i32" | "eq_i32" => return Err(arity_err("2")),
+
         "const_i32" | "const_i64" | "const_f32" => return Err(arity_err("1")),
 
         other => {
@@ -404,10 +513,12 @@ fn op_spec_for(
                 call_span,
                 format!(
                     "unknown function `{}` inside #[triton_kernel] body. \
-                     Supported (Phase 3.3 step 1): \
-                     program_id, load, store, return_, \
+                     Supported: \
+                     program_id, load (1-2 args), store (2-3 args), return_, \
+                     make_range, splat_1d, addptr, \
                      const_i32, const_i64, const_f32, \
-                     add_i32, sub_i32, mul_i32, add_f32, mul_f32",
+                     add_i32, sub_i32, mul_i32, add_f32, mul_f32, \
+                     lt_i32, le_i32, eq_i32",
                     other
                 ),
             ));
