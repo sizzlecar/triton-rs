@@ -33,11 +33,53 @@ pub fn expand(input: &ItemFn) -> Result<TokenStream2, syn::Error> {
     let body_stmts = translate_block(&input.block, &mut tmp_counter)?;
 
     let vis = &input.vis;
-    Ok(quote! {
-        #[allow(non_camel_case_types)]
-        #vis struct #fn_name;
 
-        impl #fn_name {
+    // Preserve the function's generics so callers can write
+    // `kernel_name::<1024>::mlir()`. Const generic params (e.g.
+    // `<const BLOCK: usize>`) are visible inside the body since the
+    // proc-macro emits the body unchanged where it references them.
+    let (impl_gen, ty_gen, where_clause) = input.sig.generics.split_for_impl();
+    let has_generics = !input.sig.generics.params.is_empty();
+
+    // For unit-struct-with-generics we need PhantomData to "use" any type/
+    // lifetime params. Const generics alone don't need it. Detect to keep
+    // the simple case clean.
+    let needs_phantom = input
+        .sig
+        .generics
+        .params
+        .iter()
+        .any(|p| !matches!(p, syn::GenericParam::Const(_)));
+
+    // Struct definitions need the *declaration*-style generics
+    // (`<const BLOCK: usize>`), which ImplGenerics emits — TypeGenerics
+    // would emit `<BLOCK>` alone, dropping the kind/bound and triggering
+    // E0392 / E0747 at the use site.
+    let struct_def = if has_generics {
+        if needs_phantom {
+            quote! {
+                #[allow(non_camel_case_types)]
+                #vis struct #fn_name #impl_gen #where_clause (
+                    ::std::marker::PhantomData<fn() #ty_gen>,
+                );
+            }
+        } else {
+            quote! {
+                #[allow(non_camel_case_types)]
+                #vis struct #fn_name #impl_gen #where_clause;
+            }
+        }
+    } else {
+        quote! {
+            #[allow(non_camel_case_types)]
+            #vis struct #fn_name;
+        }
+    };
+
+    Ok(quote! {
+        #struct_def
+
+        impl #impl_gen #fn_name #ty_gen #where_clause {
             /// Build the MLIR `Module` for this kernel.
             // Args bound for the user's reference may legitimately go unused
             // (e.g. signature-only kernels in tests); auto-hoisted temps in
@@ -267,11 +309,25 @@ fn translate_expr(
             expr: quote! { #expr },
         }),
         Expr::Paren(p) => translate_expr(&p.expr, hoist, counter),
+        // `BLOCK as i32` (cast) is a runtime Rust expression evaluated at
+        // module()-build time. The whole thing passes through unchanged —
+        // it's ordinary Rust, not a kernel-IR construct.
+        Expr::Cast(_) => Ok(TranslatedExpr {
+            setup: vec![],
+            expr: quote! { (#expr) },
+        }),
+        // Method calls on plain values (e.g. `args[0].clone()` if the user
+        // ever writes one) are also pass-through. Don't attempt to
+        // translate them as kernel ops.
+        Expr::MethodCall(_) | Expr::Index(_) | Expr::Field(_) => Ok(TranslatedExpr {
+            setup: vec![],
+            expr: quote! { (#expr) },
+        }),
         other => Err(syn::Error::new(
             other.span(),
             "this expression form is not yet supported inside #[triton_kernel] bodies \
-             (supported: function calls, binary ops `+ - * < <= > >= == !=`, \
-             variable refs, integer literals)",
+             (supported: function calls, binary ops `+ - * / < <= > >= == !=`, \
+             casts `x as T`, variable refs, integer literals)",
         )),
     }
 }
