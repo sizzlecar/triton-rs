@@ -153,6 +153,63 @@ impl<'m> FuncBuilder<'m> {
         assert!(r.is_empty(), "op_void called on op with {} results", r.len());
     }
 
+    /// Allocate a new region whose entry block carries the supplied argument
+    /// types. Returns the empty region and the freshly-bound SSA values for
+    /// the entry-block args (typically loop-induction variable + iter_args
+    /// for `scf.for`, or branch params for `scf.if`).
+    ///
+    /// SSA IDs come from the same counter as the rest of the function, so
+    /// values are unique across the whole function (MLIR's "isolated from
+    /// above" rule for function bodies).
+    pub fn new_region(&mut self, arg_types: Vec<Type>) -> (Region, Vec<Value>) {
+        let entry_args: Vec<Value> = arg_types
+            .into_iter()
+            .map(|t| self.counter.fresh(t))
+            .collect();
+        let region = Region {
+            blocks: vec![Block::with_args(entry_args.clone())],
+        };
+        (region, entry_args)
+    }
+
+    /// Append an op into a freshly-built (or otherwise existing) region's
+    /// entry block. Use this together with [`Self::new_region`] to construct
+    /// the bodies of region-having ops like `scf.for`/`scf.if` before
+    /// passing the region to their op constructor.
+    pub fn append_to_region(&mut self, region: &mut Region, spec: OpSpec) -> Vec<Value> {
+        let results: Vec<Value> = spec
+            .result_types
+            .iter()
+            .map(|t| self.counter.fresh(t.clone()))
+            .collect();
+        if region.blocks.is_empty() {
+            region.blocks.push(Block::new());
+        }
+        let block = region.blocks.first_mut().expect("region has at least one block");
+        block.ops.push(crate::op::Op {
+            name: spec.name,
+            operands: spec.operands,
+            results: results.clone(),
+            attrs: spec.attrs,
+            regions: spec.regions,
+        });
+        results
+    }
+
+    /// Like [`Self::append_to_region`] but asserts the op produces exactly
+    /// one result.
+    pub fn append_to_region_one(&mut self, region: &mut Region, spec: OpSpec) -> Value {
+        let mut r = self.append_to_region(region, spec);
+        assert_eq!(r.len(), 1, "append_to_region_one called on op with {} results", r.len());
+        r.pop().unwrap()
+    }
+
+    /// Like [`Self::append_to_region`] but asserts the op produces no results.
+    pub fn append_to_region_void(&mut self, region: &mut Region, spec: OpSpec) {
+        let r = self.append_to_region(region, spec);
+        assert!(r.is_empty(), "append_to_region_void called on op with {} results", r.len());
+    }
+
     /// Commit the function to its parent module.
     pub fn finish(mut self) {
         self.committed = true;
