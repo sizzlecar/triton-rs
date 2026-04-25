@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Layer 1: GitHub free runner — fmt / clippy / build / unit tests
+  # Runs on every PR. Catches 95% of regressions without needing a GPU.
+  # ────────────────────────────────────────────────────────────────
+  cpu-quality-gate:
+    name: CPU quality gate (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cpu-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cpu-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Type check (workspace, all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Unit tests (default features = CPU emulation)
+        run: cargo test --workspace
+
+  # ────────────────────────────────────────────────────────────────
+  # Layer 2: CUDA build-only — type-checks the cuda feature paths.
+  # Does NOT compile the vendored Triton (that takes ~30 min cold).
+  # The compile-triton feature is exercised manually / nightly only.
+  # ────────────────────────────────────────────────────────────────
+  cuda-typecheck:
+    name: CUDA type check (Linux, container)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+    steps:
+      - name: Install Rust + system deps
+        run: |
+          apt-get update
+          apt-get install -y curl build-essential pkg-config libssl-dev git cmake
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Type check (--features cuda)
+        env:
+          CUDA_COMPUTE_CAP: "80"
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo check --workspace --features cuda
+
+  # ────────────────────────────────────────────────────────────────
+  # Layer 3: Self-hosted GPU runner — full e2e + benchmarks.
+  # Only runs when a PR carries the "gpu" label, or on push to main.
+  # ────────────────────────────────────────────────────────────────
+  cuda-e2e:
+    name: CUDA end-to-end (self-hosted)
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'gpu')
+    runs-on: [self-hosted, linux, gpu]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build (with vendored Triton)
+        run: cargo build --workspace --features "cuda compile-triton" --release
+
+      - name: End-to-end tests
+        run: cargo test --workspace --features "cuda compile-triton" --release --test '*_e2e'
