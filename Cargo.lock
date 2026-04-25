@@ -321,6 +321,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+ "triton-ir",
 ]
 
 [[package]]

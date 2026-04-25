@@ -1,11 +1,23 @@
-//! Codegen for `#[triton_kernel]`. Splits responsibility into two pieces:
-//!   1. Map a Rust function signature → a list of (arg name, IR type expr).
-//!   2. Wrap the result in a `pub struct <name>;` + `impl` providing the
+//! Codegen for `#[triton_kernel]`.
+//!
+//! Splits responsibility into:
+//!   1. Map a Rust function signature → IR type expressions for each arg.
+//!   2. Translate the function body's statements/exprs into IR builder calls
+//!      against the `__triton_f: FuncBuilder` we hold in scope.
+//!   3. Wrap the result in a `pub struct <name>;` + `impl` providing the
 //!      `module()` / `mlir()` accessors.
+//!
+//! ## Internal naming
+//!
+//! All locals introduced by the macro are prefixed `__triton_` so they
+//! cannot collide with a kernel argument the user happens to name `m` /
+//! `f` / etc.
 
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, FnArg, ItemFn, Pat, PathArguments, Type};
+use syn::{
+    spanned::Spanned, Block, Expr, ExprCall, FnArg, ItemFn, Local, Pat, PathArguments, Stmt, Type,
+};
 
 /// Top-level expansion entry point.
 pub fn expand(input: &ItemFn) -> Result<TokenStream2, syn::Error> {
@@ -14,6 +26,11 @@ pub fn expand(input: &ItemFn) -> Result<TokenStream2, syn::Error> {
 
     let arg_decls = collect_arg_decls(input)?;
 
+    // Counter for auto-generated temporary names introduced by call-arg
+    // hoisting. Lives only during expansion; reset per kernel.
+    let mut tmp_counter: u32 = 0;
+    let body_stmts = translate_block(&input.block, &mut tmp_counter)?;
+
     let vis = &input.vis;
     Ok(quote! {
         #[allow(non_camel_case_types)]
@@ -21,19 +38,18 @@ pub fn expand(input: &ItemFn) -> Result<TokenStream2, syn::Error> {
 
         impl #fn_name {
             /// Build the MLIR `Module` for this kernel.
-            ///
-            /// Phase 3.1: signature only — the body is a single `tt.return`
-            /// terminator. Phase 3.3 will translate the user-written body
-            /// into IR builder calls here.
+            // Args bound for the user's reference may legitimately go unused
+            // (e.g. signature-only kernels in tests); auto-hoisted temps in
+            // nested calls produce identifiers we never re-read by design.
+            #[allow(unused_variables)]
             pub fn module() -> ::triton_ir::module::Module {
-                use ::triton_ir::prelude::*;
-
-                let mut m = Module::new();
-                let mut f = m.func(#kernel_name);
+                let mut __triton_module = ::triton_ir::module::Module::new();
+                let mut __triton_f = __triton_module.func(#kernel_name);
                 #(#arg_decls)*
-                f.op_void(tt::return_());
-                f.finish();
-                m
+                #body_stmts
+                __triton_f.op_void(::triton_ir::dialect::tt::return_());
+                __triton_f.finish();
+                __triton_module
             }
 
             /// Pretty-printed MLIR text for this kernel.
@@ -44,11 +60,15 @@ pub fn expand(input: &ItemFn) -> Result<TokenStream2, syn::Error> {
     })
 }
 
-/// Walk the function's arguments, mapping each to a `let _argN = f.arg(...)`
-/// statement that calls into the IR builder.
+// ── Signature handling ──────────────────────────────────────────────────
+
+/// Map each function arg to a `let <name> = __triton_f.arg(...)` statement.
+/// The Rust binding uses the user's actual argument identifier so the body
+/// can refer to args by name (`store(out, v)` references the `out` arg
+/// directly).
 fn collect_arg_decls(input: &ItemFn) -> Result<Vec<TokenStream2>, syn::Error> {
     let mut out = Vec::with_capacity(input.sig.inputs.len());
-    for (i, fn_arg) in input.sig.inputs.iter().enumerate() {
+    for fn_arg in input.sig.inputs.iter() {
         let pat_type = match fn_arg {
             FnArg::Typed(p) => p,
             FnArg::Receiver(r) => {
@@ -58,8 +78,8 @@ fn collect_arg_decls(input: &ItemFn) -> Result<Vec<TokenStream2>, syn::Error> {
                 ));
             }
         };
-        let arg_name = match &*pat_type.pat {
-            Pat::Ident(p) => p.ident.to_string(),
+        let arg_ident = match &*pat_type.pat {
+            Pat::Ident(p) => p.ident.clone(),
             other => {
                 return Err(syn::Error::new(
                     other.span(),
@@ -67,18 +87,17 @@ fn collect_arg_decls(input: &ItemFn) -> Result<Vec<TokenStream2>, syn::Error> {
                 ));
             }
         };
+        let arg_name = arg_ident.to_string();
         let ty_expr = rust_type_to_ir_type(&pat_type.ty)?;
-        let var_ident = format_ident!("_arg{}", i);
-        out.push(quote! { let #var_ident = f.arg(#arg_name, #ty_expr); });
+        out.push(quote! { let #arg_ident = __triton_f.arg(#arg_name, #ty_expr); });
     }
     Ok(out)
 }
 
-/// Map a Rust type token tree into a `triton_ir::ty::Type` constructor
-/// expression.
+/// Map a Rust type token tree into a `triton_ir::ty::Type` constructor expr.
 ///
 /// Supported in Phase 3.1: `i1`, `i32`, `i64`, `f16`, `f32`, `bf16`,
-/// `Ptr<T>` (recursively). Tensor / const-generic shapes arrive in 3.2.
+/// `Ptr<T>` (recursively).
 fn rust_type_to_ir_type(ty: &Type) -> Result<TokenStream2, syn::Error> {
     let path = match ty {
         Type::Path(tp) if tp.qself.is_none() => &tp.path,
@@ -90,7 +109,6 @@ fn rust_type_to_ir_type(ty: &Type) -> Result<TokenStream2, syn::Error> {
             ));
         }
     };
-
     let seg = path
         .segments
         .last()
@@ -135,4 +153,265 @@ fn rust_type_to_ir_type(ty: &Type) -> Result<TokenStream2, syn::Error> {
             ),
         )),
     }
+}
+
+// ── Body translation (Phase 3.3) ────────────────────────────────────────
+//
+// Recognised user syntax:
+//   - `let x = <expr>;`            — pass through, RHS translated
+//   - `<expr>;` and trailing `<expr>` — translated, side-effecting
+//   - call expressions (see `op_spec_for` for the supported names)
+//   - path expressions (variable references) and integer literals
+//     (used as numeric arguments to known calls)
+//
+// Nested calls are auto-hoisted into named temporaries so the borrow
+// checker doesn't see two simultaneous mut borrows of `__triton_f`.
+
+#[derive(Debug, Clone, Copy)]
+enum CallKind {
+    /// Produces an SSA `Value` — emitted via `__triton_f.op_one(spec)`.
+    Value,
+    /// Side-effect only — emitted via `__triton_f.op_void(spec)`.
+    Void,
+}
+
+/// Result of translating an expression: zero or more setup statements,
+/// followed by a single Rust expression that evaluates to the desired
+/// value (or `()` for void calls).
+struct TranslatedExpr {
+    setup: Vec<TokenStream2>,
+    expr: TokenStream2,
+}
+
+fn translate_block(block: &Block, counter: &mut u32) -> Result<TokenStream2, syn::Error> {
+    let mut out = Vec::with_capacity(block.stmts.len());
+    for stmt in &block.stmts {
+        out.push(translate_stmt(stmt, counter)?);
+    }
+    Ok(quote! { #(#out)* })
+}
+
+fn translate_stmt(stmt: &Stmt, counter: &mut u32) -> Result<TokenStream2, syn::Error> {
+    match stmt {
+        Stmt::Local(local) => translate_local(local, counter),
+        Stmt::Expr(expr, maybe_semi) => {
+            // Top-level statement: no need to hoist a top-level call (the
+            // statement boundary already releases the borrow).
+            let t = translate_expr(expr, /*hoist=*/ false, counter)?;
+            let setup = &t.setup;
+            let e = &t.expr;
+            if let Some(semi) = maybe_semi {
+                Ok(quote! { #(#setup)* #e #semi })
+            } else {
+                // Trailing expr — discard its value, kernel funcs return ().
+                Ok(quote! { #(#setup)* let _ = #e; })
+            }
+        }
+        Stmt::Item(item) => Err(syn::Error::new(
+            item.span(),
+            "nested items are not supported inside #[triton_kernel] bodies",
+        )),
+        Stmt::Macro(m) => Err(syn::Error::new(
+            m.span(),
+            "macro invocations are not supported inside #[triton_kernel] bodies (Phase 3.3 step 1)",
+        )),
+    }
+}
+
+fn translate_local(local: &Local, counter: &mut u32) -> Result<TokenStream2, syn::Error> {
+    let init = local.init.as_ref().ok_or_else(|| {
+        syn::Error::new(
+            local.span(),
+            "`let` bindings inside #[triton_kernel] must have an initializer",
+        )
+    })?;
+    if init.diverge.is_some() {
+        return Err(syn::Error::new(
+            init.diverge.as_ref().unwrap().0.span,
+            "`let ... else { ... }` is not supported inside #[triton_kernel] bodies",
+        ));
+    }
+    let pat = &local.pat;
+    // The let binding itself acts as the hoist for the top-level expression.
+    let t = translate_expr(&init.expr, /*hoist=*/ false, counter)?;
+    let setup = &t.setup;
+    let rhs = &t.expr;
+    Ok(quote! {
+        #(#setup)*
+        let #pat = #rhs;
+    })
+}
+
+fn translate_expr(
+    expr: &Expr,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    match expr {
+        Expr::Call(call) => translate_call(call, hoist, counter),
+        // Variable references and literals pass through unchanged.
+        Expr::Path(_) | Expr::Lit(_) => Ok(TranslatedExpr {
+            setup: vec![],
+            expr: quote! { #expr },
+        }),
+        Expr::Paren(p) => translate_expr(&p.expr, hoist, counter),
+        other => Err(syn::Error::new(
+            other.span(),
+            "this expression form is not yet supported inside #[triton_kernel] bodies \
+             (Phase 3.3 step 1 supports: function calls, variable refs, integer literals)",
+        )),
+    }
+}
+
+fn translate_call(
+    call: &ExprCall,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    // Args to a call are always evaluated to a temporary first to avoid
+    // multiple simultaneous mut borrows of __triton_f.
+    let mut setup = Vec::new();
+    let mut translated_args = Vec::new();
+    for arg in &call.args {
+        let t = translate_expr(arg, /*hoist=*/ true, counter)?;
+        setup.extend(t.setup);
+        translated_args.push(t.expr);
+    }
+
+    let name = call_name(call)?;
+    let (kind, spec_expr) = op_spec_for(&name, &translated_args, call.span())?;
+
+    let call_expr = match kind {
+        CallKind::Value => quote! { __triton_f.op_one(#spec_expr) },
+        CallKind::Void => quote! { __triton_f.op_void(#spec_expr) },
+    };
+
+    // Hoist value-producing calls used as sub-expressions into named temps.
+    if hoist && matches!(kind, CallKind::Value) {
+        let tmp = format_ident!("__triton_tmp_{}", *counter);
+        *counter += 1;
+        setup.push(quote! { let #tmp = #call_expr; });
+        Ok(TranslatedExpr {
+            setup,
+            expr: quote! { #tmp },
+        })
+    } else {
+        Ok(TranslatedExpr {
+            setup,
+            expr: call_expr,
+        })
+    }
+}
+
+fn call_name(call: &ExprCall) -> Result<String, syn::Error> {
+    match &*call.func {
+        Expr::Path(p) if p.qself.is_none() => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .ok_or_else(|| syn::Error::new(p.span(), "empty function path")),
+        other => Err(syn::Error::new(
+            other.span(),
+            "expected a bare function name (e.g. `program_id`, `const_i32`, ...)",
+        )),
+    }
+}
+
+/// Vocabulary of recognised function names → IR builder helpers.
+/// Anything not listed here errors out at compile time.
+fn op_spec_for(
+    name: &str,
+    args: &[TokenStream2],
+    call_span: Span,
+) -> Result<(CallKind, TokenStream2), syn::Error> {
+    let n = args.len();
+    let arity_err = |needed: &str| -> syn::Error {
+        syn::Error::new(
+            call_span,
+            format!("`{}` expects {} arguments, got {}", name, needed, n),
+        )
+    };
+
+    let result = match name {
+        // ── tt dialect ──
+        "program_id" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::get_program_id(#(#args),*) },
+        ),
+        "program_id" => return Err(arity_err("1")),
+
+        "load" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::load(#(#args),*, ::std::option::Option::None) },
+        ),
+        "load" => return Err(arity_err("1 (no mask)")),
+
+        "store" if n == 2 => (
+            CallKind::Void,
+            quote! {
+                ::triton_ir::dialect::tt::store(#(#args),*, ::std::option::Option::None)
+            },
+        ),
+        "store" => return Err(arity_err("2 (no mask)")),
+
+        "return_" if n == 0 => (
+            CallKind::Void,
+            quote! { ::triton_ir::dialect::tt::return_() },
+        ),
+        "return_" => return Err(arity_err("0")),
+
+        // ── arith dialect (explicit type suffixes) ──
+        "const_i32" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::constant_i32(#(#args),*) },
+        ),
+        "const_i64" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::constant_i64(#(#args),*) },
+        ),
+        "const_f32" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::constant_f32(#(#args),*) },
+        ),
+
+        "add_i32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::addi(#(#args),*) },
+        ),
+        "sub_i32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::subi(#(#args),*) },
+        ),
+        "mul_i32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::muli(#(#args),*) },
+        ),
+        "add_f32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::addf(#(#args),*) },
+        ),
+        "mul_f32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::mulf(#(#args),*) },
+        ),
+        "add_i32" | "sub_i32" | "mul_i32" | "add_f32" | "mul_f32" => return Err(arity_err("2")),
+
+        "const_i32" | "const_i64" | "const_f32" => return Err(arity_err("1")),
+
+        other => {
+            return Err(syn::Error::new(
+                call_span,
+                format!(
+                    "unknown function `{}` inside #[triton_kernel] body. \
+                     Supported (Phase 3.3 step 1): \
+                     program_id, load, store, return_, \
+                     const_i32, const_i64, const_f32, \
+                     add_i32, sub_i32, mul_i32, add_f32, mul_f32",
+                    other
+                ),
+            ));
+        }
+    };
+    Ok(result)
 }
