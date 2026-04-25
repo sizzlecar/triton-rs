@@ -482,6 +482,54 @@ fn op_spec_for(
         ),
         "addptr" => return Err(arity_err("2 (ptrs, offsets)")),
 
+        // dot(a, b, c) — block matmul a @ b + c, dispatched by IR builder.
+        "dot" if n == 3 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::dot(#(#args),*) },
+        ),
+        "dot" => return Err(arity_err("3 (a, b, c_init)")),
+
+        // broadcast_2d(input, m, n)
+        "broadcast_2d" if n == 3 => {
+            let input = &args[0];
+            let m_dim = &args[1];
+            let n_dim = &args[2];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::tt::broadcast(
+                        #input,
+                        ::std::vec![(#m_dim) as i64, (#n_dim) as i64],
+                    )
+                },
+            )
+        }
+        "broadcast_2d" => return Err(arity_err("3 (input, m, n)")),
+
+        // expand_dims(input, axis)
+        "expand_dims" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::expand_dims(#(#args),*) },
+        ),
+        "expand_dims" => return Err(arity_err("2 (input, axis)")),
+
+        // reshape_2d(input, m, n)
+        "reshape_2d" if n == 3 => {
+            let input = &args[0];
+            let m_dim = &args[1];
+            let n_dim = &args[2];
+            (
+                CallKind::Value,
+                quote! {
+                    ::triton_ir::dialect::tt::reshape(
+                        #input,
+                        ::std::vec![(#m_dim) as i64, (#n_dim) as i64],
+                    )
+                },
+            )
+        }
+        "reshape_2d" => return Err(arity_err("3 (input, m, n)")),
+
         "return_" if n == 0 => (
             CallKind::Void,
             quote! { ::triton_ir::dialect::tt::return_() },
@@ -574,6 +622,7 @@ fn op_spec_for(
                      Supported: \
                      program_id, load (1-2 args), store (2-3 args), return_, \
                      make_range, splat_1d, addptr, \
+                     dot, broadcast_2d, expand_dims, reshape_2d, \
                      const_i32, const_i64, const_f32, \
                      add_i32, sub_i32, mul_i32, add_f32, mul_f32, \
                      lt_i32, le_i32, eq_i32",

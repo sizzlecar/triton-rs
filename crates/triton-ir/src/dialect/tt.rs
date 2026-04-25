@@ -132,3 +132,67 @@ pub fn store(ptrs: Value, values: Value, mask: Option<Value>) -> OpSpec {
 pub fn return_() -> OpSpec {
     OpSpec::new("tt.return")
 }
+
+// ── tile-level matrix and shape ops ─────────────────────────────────────
+
+/// `tt.dot %a, %b, %c` — block-level matmul: `a` (`M×K`) * `b` (`K×N`)
+/// accumulated into `c` (`M×N`). Result type matches `c`. Common dtypes:
+/// inputs `f16`/`bf16`/`tf32`, accumulator `f32`. The op's default
+/// attributes (`inputPrecision = ieee`, etc.) are inferred by the parser
+/// when omitted.
+pub fn dot(a: Value, b: Value, c: Value) -> OpSpec {
+    let result_ty = c.ty().clone();
+    OpSpec::new("tt.dot")
+        .with_operand(a)
+        .with_operand(b)
+        .with_operand(c)
+        .with_result(result_ty)
+}
+
+/// `tt.broadcast %x : tensor<...> -> tensor<target_shape>`. Input must be a
+/// tensor whose shape, after singleton-dim expansion, matches the target.
+/// Element type is preserved.
+pub fn broadcast(input: Value, target_shape: Vec<i64>) -> OpSpec {
+    let elem_ty = match input.ty() {
+        Type::Tensor { elem, .. } => (**elem).clone(),
+        other => panic!("tt.broadcast expected a tensor, got {}", other),
+    };
+    OpSpec::new("tt.broadcast")
+        .with_operand(input)
+        .with_result(Type::tensor(target_shape, elem_ty))
+}
+
+/// `tt.expand_dims %x {axis = N : i32}` — insert a singleton dimension at
+/// position `axis` in `input`'s shape. Negative axes count from the back.
+pub fn expand_dims(input: Value, axis: i32) -> OpSpec {
+    let result_ty = match input.ty() {
+        Type::Tensor { shape, elem } => {
+            let rank = shape.len() as i32;
+            let axis_idx = if axis < 0 {
+                (rank + 1 + axis) as usize
+            } else {
+                axis as usize
+            };
+            let mut new_shape = shape.clone();
+            new_shape.insert(axis_idx, 1);
+            Type::tensor(new_shape, (**elem).clone())
+        }
+        other => panic!("tt.expand_dims expected a tensor, got {}", other),
+    };
+    OpSpec::new("tt.expand_dims")
+        .with_operand(input)
+        .with_result(result_ty)
+        .with_attr("axis", crate::attr::Attr::i32(axis))
+}
+
+/// `tt.reshape %x : tensor<...> -> tensor<new_shape>`. Element count must
+/// be preserved (caller's responsibility — the IR builder doesn't check).
+pub fn reshape(input: Value, new_shape: Vec<i64>) -> OpSpec {
+    let elem_ty = match input.ty() {
+        Type::Tensor { elem, .. } => (**elem).clone(),
+        other => panic!("tt.reshape expected a tensor, got {}", other),
+    };
+    OpSpec::new("tt.reshape")
+        .with_operand(input)
+        .with_result(Type::tensor(new_shape, elem_ty))
+}
