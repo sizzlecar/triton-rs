@@ -14,3 +14,9 @@ proc-macro = true
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
+
+[dev-dependencies]
+# Tests for the proc-macro need triton-ir's real `Module`/`Type`/etc. to
+# evaluate the generated code at runtime. Only a dev-dep — users of
+# triton-dsl bring their own triton-ir via triton-core or directly.
+triton-ir.workspace = true
