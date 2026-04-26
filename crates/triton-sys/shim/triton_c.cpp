@@ -316,7 +316,7 @@ static std::string llvm_to_ptx(llvm::Module& mod, int capability) {
 
     llvm::TargetOptions opt;
     auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
-    auto* tm = target->createTargetMachine(triple, proc, features, opt, rm,
+    auto* tm = target->createTargetMachine(llvm::Triple(triple), proc, features, opt, rm,
                                            std::nullopt, llvm::CodeGenOptLevel::Aggressive);
     if (!tm) throw std::runtime_error("createTargetMachine failed");
 
@@ -469,7 +469,7 @@ TritonResult* triton_compile_mlir(
         auto* nvtarget = llvm::TargetRegistry::lookupTarget(triple, err);
         if (!nvtarget) return make_error("nvptx target lookup: " + err);
         std::unique_ptr<llvm::TargetMachine> tm{nvtarget->createTargetMachine(
-            triple, proc, features, llvm::TargetOptions{},
+            llvm::Triple(triple), proc, features, llvm::TargetOptions{},
             std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_), std::nullopt,
             llvm::CodeGenOptLevel::Aggressive)};
         if (!tm) return make_error("createTargetMachine failed");
