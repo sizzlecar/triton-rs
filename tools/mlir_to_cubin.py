@@ -56,7 +56,20 @@ def main() -> int:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    src = IRSource(args.input)
+    # IRSource picks the right pass entry-point off the file extension.
+    # `.ttir` = Triton IR (high level — what triton-ir emits).
+    # `.ttgir` = TritonGPU IR (already lowered).
+    # `.mlir` is rejected — IRSource doesn't recognise that extension.
+    # Copy to a `.ttir` if needed so callers can hand us anything.
+    input_path = args.input
+    if not input_path.endswith((".ttir", ".ttgir")):
+        import shutil
+        ttir_path = os.path.join(args.output_dir, "kernel.ttir")
+        shutil.copy(input_path, ttir_path)
+        input_path = ttir_path
+        print(f"# copied {args.input} -> {ttir_path} for IRSource", file=sys.stderr)
+
+    src = IRSource(input_path)
     target = GPUTarget("cuda", args.arch, 32)
     opts = CUDAOptions(
         num_warps=args.num_warps,
