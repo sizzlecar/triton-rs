@@ -236,13 +236,75 @@ mod compile_triton {
             // exception-free internally, but we keep -fexceptions on the
             // shim so its own try/catch compiles. -fno-rtti stays.
             .flag("-fno-rtti");
+
+        // Bundle Triton's OBJECT-library outputs (~100+ .o files under
+        // triton-build/build/{lib,third_party}/.../CMakeFiles/<lib>.dir/*.o)
+        // into the same libtriton_c.a we're producing. This avoids the
+        // "Triton declared OBJECT libs, no .a files exist" problem.
+        let triton_objs = collect_triton_objects(triton_build);
+        for o in &triton_objs {
+            build.object(o);
+        }
+        eprintln!("triton-sys: bundling {} Triton object files", triton_objs.len());
         build.compile("triton_c");
 
-        // TODO(phase-1B): emit `cargo:rustc-link-search=native={}/lib`
-        // for triton_build and llvm_root, plus the long list of
-        // `cargo:rustc-link-lib=static=...` for each Triton/MLIR/LLVM
-        // archive. Order matters; will be discovered in 1B by reading
-        // ${triton_build}/lib/*.a.
+        // Now emit link directives for LLVM/MLIR static libs (Triton's
+        // syms are already in libtriton_c.a above).
+        let llvm_lib = llvm_root.join("lib");
+        println!("cargo:rustc-link-search=native={}", llvm_lib.display());
+        // Use --start-group/--end-group so the linker resolves the LLVM/MLIR
+        // archives in any order (LLVM has heavy circular deps).
+        println!("cargo:rustc-link-arg=-Wl,--start-group");
+        for entry in std::fs::read_dir(&llvm_lib).expect("read llvm/lib") {
+            let p = entry.unwrap().path();
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if let Some(name) = stem.strip_prefix("lib") {
+                    if p.extension().and_then(|e| e.to_str()) == Some("a") {
+                        println!("cargo:rustc-link-lib=static={}", name);
+                    }
+                }
+            }
+        }
+        println!("cargo:rustc-link-arg=-Wl,--end-group");
+
+        // System libs Triton + LLVM rely on.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=z");
+        println!("cargo:rustc-link-lib=dylib=zstd");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=m");
+    }
+
+    /// Walk Triton's cmake build tree and return every `.o` produced by
+    /// the OBJECT libraries we built. We simply glob — the alternative
+    /// (parsing CMakeFiles to know exactly which targets contributed which
+    /// objects) is fragile across cmake versions and v3.2.0 → v3.6.0.
+    fn collect_triton_objects(triton_build: &PathBuf) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let build_root = triton_build.join("build");
+        for sub in &["lib", "third_party"] {
+            let p = build_root.join(sub);
+            if p.is_dir() {
+                walk_for_o(&p, &mut out);
+            }
+        }
+        // Skip TritonTestAnalysis (test-only code).
+        out.retain(|p| !p.to_string_lossy().contains("TritonTestAnalysis"));
+        out
+    }
+
+    fn walk_for_o(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk_for_o(&p, out);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("o") {
+                    out.push(p);
+                }
+            }
+        }
     }
 
     /// Step 5 — bindgen the C header into Rust types.
