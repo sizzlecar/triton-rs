@@ -423,6 +423,14 @@ fn translate_call(
         if n == "reduce" {
             return translate_reduce(call, hoist, counter);
         }
+        // `max` / `min` go through inherent FuncBuilder methods (same path
+        // as the binary operators) so the final emit is a direct method
+        // call returning Value — NOT wrapped in `op_one(...)`. The generic
+        // op_spec_for path would double-wrap and produce
+        // `op_one(__triton_f.max(...))`, which is a type error.
+        if matches!(n, "max" | "min") {
+            return translate_method_call_2arg(call, n, hoist, counter);
+        }
     }
 
     // Args to a call are always evaluated to a temporary first to avoid
@@ -444,6 +452,32 @@ fn translate_call(
     };
 
     Ok(maybe_hoist(setup, call_expr, kind, hoist, counter))
+}
+
+/// Translate `max(a, b)` / `min(a, b)` into a direct FuncBuilder method
+/// call. Lives in the special-form list so it doesn't get double-wrapped
+/// by op_spec_for's `op_one(...)` envelope.
+fn translate_method_call_2arg(
+    call: &ExprCall,
+    method: &str,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    if call.args.len() != 2 {
+        return Err(syn::Error::new(
+            call.span(),
+            format!("`{}` expects 2 arguments, got {}", method, call.args.len()),
+        ));
+    }
+    let a_t = translate_expr(&call.args[0], /*hoist=*/ true, counter)?;
+    let b_t = translate_expr(&call.args[1], /*hoist=*/ true, counter)?;
+    let mut setup = a_t.setup;
+    setup.extend(b_t.setup);
+    let a = a_t.expr;
+    let b = b_t.expr;
+    let method_ident = format_ident!("{}", method);
+    let call_expr = quote! { __triton_f.#method_ident(#a, #b) };
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
 }
 
 /// Translate `scf_for(lb, ub, step, init, |i, acc| body)` into a call to
@@ -873,20 +907,10 @@ fn op_spec_for(
             quote! { ::triton_ir::dialect::tt::erf(#(#args),*) },
         ),
 
-        // Type-dispatched max / min — methods on FuncBuilder so they work in
-        // both top-level and closure-body context (same auto-reborrow trick
-        // as the binary operators).
-        "max" if n == 2 => {
-            let a = &args[0];
-            let b = &args[1];
-            (CallKind::Value, quote! { __triton_f.max(#a, #b) })
-        }
-        "min" if n == 2 => {
-            let a = &args[0];
-            let b = &args[1];
-            (CallKind::Value, quote! { __triton_f.min(#a, #b) })
-        }
-        "max" | "min" => return Err(arity_err("2")),
+        // max / min are handled before this match by `translate_method_call_2arg`.
+        // If we somehow get here with them, that's a logic bug — surface it
+        // clearly rather than silently double-wrapping.
+        "max" | "min" => unreachable!("max/min should be handled by translate_method_call_2arg"),
         "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "sin" | "cos" | "abs"
         | "tanh" | "erf" => {
             return Err(arity_err("1"));
