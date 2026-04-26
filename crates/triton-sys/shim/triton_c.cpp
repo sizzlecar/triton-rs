@@ -329,6 +329,21 @@ static std::string extract_kernel_name(const std::string& ptx) {
     return "kernel";  // fallback; metadata.name still usable
 }
 
+// Strip the ", debug" / "debug, " modifier from PTX `.target` lines.
+// Triton's compiler.py does this verbatim with the comment "Remove the
+// debug flag that prevents ptxas from optimizing the code". Without it,
+// ptxas treats the kernel as a debug build and disables most opts —
+// observed as a 13-14% perf gap vs Python on math-heavy benches.
+// We also keep emitting the LLVM DI-scope pass for source-line info,
+// which ptxas picks up via `-lineinfo` instead.
+static std::string strip_debug_target(std::string ptx) {
+    static const std::regex re_with_comma_after(R"(,\s*debug)");
+    static const std::regex re_with_comma_before(R"(debug,\s*)");
+    ptx = std::regex_replace(ptx, re_with_comma_after, "");
+    ptx = std::regex_replace(ptx, re_with_comma_before, "");
+    return ptx;
+}
+
 // ── ptxas spawn ───────────────────────────────────────────────────
 static std::vector<uint8_t> spawn_ptxas(
     const std::string& ptx_text,
@@ -458,7 +473,7 @@ TritonResult* triton_compile_mlir(
         optimize_module_O3(*llvm_mod, *tm);
 
         // 5. llvm::Module → PTX text.
-        std::string ptx = llvm_to_ptx(*llvm_mod, capability);
+        std::string ptx = strip_debug_target(llvm_to_ptx(*llvm_mod, capability));
 
         // 6. PTX → cubin (spawn ptxas).
         std::string ptxas_err;
