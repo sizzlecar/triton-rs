@@ -418,3 +418,155 @@ pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
     let out_off = q_head * head_dim + dim_range;
     store(output + out_off, out_v, dim_mask);
 }
+
+/// **Flash decode attention — Phase 1 (split-K)**.
+///
+/// Splits the KV stream across `num_splits` blocks per Q head. Each block
+/// runs the same online-softmax over its slice and writes UNNORMALIZED
+/// state (`partial_acc`, `partial_max`, `partial_sum`) to global memory.
+/// Phase 2 then combines the per-split partials via log-sum-exp.
+///
+/// Shapes (caller pads `valid_kv_len` to `num_splits * BLOCK_KV`):
+/// - `q`               : `[num_q_heads, head_dim]`
+/// - `k_cache, v_cache`: `[seq_len, num_kv_heads, head_dim]`
+/// - `partial_acc`     : `[num_q_heads, num_splits, head_dim]` f32
+/// - `partial_max`     : `[num_q_heads, num_splits]`           f32
+/// - `partial_sum`     : `[num_q_heads, num_splits]`           f32
+///
+/// Launch: grid = (num_q_heads, num_splits, 1).
+#[triton_kernel]
+pub fn flash_decode_attn_phase1_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
+    q: Ptr<f32>,
+    k_cache: Ptr<f32>,
+    v_cache: Ptr<f32>,
+    partial_acc: Ptr<f32>,
+    partial_max: Ptr<f32>,
+    partial_sum: Ptr<f32>,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    valid_kv_len: i32,
+    num_splits: i32,
+    scale: f32,
+) {
+    let _ = num_q_heads;
+    let q_head = program_id(0);
+    let split_id = program_id(1);
+    let num_kv_groups = num_q_heads / num_kv_heads;
+    let kv_head = q_head / num_kv_groups;
+
+    let dim_range = make_range(0, HEAD_DIM as i32);
+    let dim_mask = dim_range < head_dim;
+    let q_off = q_head * head_dim + dim_range;
+    let q_v = load(q + q_off, dim_mask);
+
+    let m_init = const_f32(0.0_f32) - const_f32(1.0e30_f32);
+    let l_init = const_f32(0.0_f32);
+    let acc_init = q_v * 0.0_f32;
+
+    let kv_stride = num_kv_heads * head_dim;
+    let chunk_blocks = (valid_kv_len / num_splits) / (BLOCK_KV as i32);
+    let split_start_block = split_id * chunk_blocks;
+
+    let (m_final, l_final, acc_final) = scf_for(
+        const_i32(0),
+        chunk_blocks,
+        const_i32(1),
+        (m_init, l_init, acc_init),
+        |kb, (m_i, l_i, acc)| {
+            let pos_base = (split_start_block + kb) * (BLOCK_KV as i32);
+            let pos_range = make_range(0, BLOCK_KV as i32) + pos_base;
+
+            let row_base = pos_range * kv_stride + kv_head * head_dim;
+            let row_base_2d = expand_dims(row_base, 1);
+            let col_2d = expand_dims(dim_range, 0);
+            let kv_off_2d = row_base_2d + col_2d;
+
+            let k_block = load(k_cache + kv_off_2d);
+            let v_block = load(v_cache + kv_off_2d);
+
+            let q_2d = expand_dims(q_v, 0);
+            let qk = q_2d * k_block;
+            let scores_raw = reduce(qk, 1, |a, b| a + b);
+            let scores = scores_raw * scale;
+
+            let scores_max = reduce(scores, 0, |a, b| max(a, b));
+            let m_ij = max(m_i, scores_max);
+            let alpha = exp(m_i - m_ij);
+            let p = exp(scores - m_ij);
+            let l_ij = reduce(p, 0, |a, b| a + b);
+
+            let p_2d = expand_dims(p, 1);
+            let pv = p_2d * v_block;
+            let pv_sum = reduce(pv, 0, |a, b| a + b);
+
+            let new_acc = acc * alpha + pv_sum;
+            let new_l_i = l_i * alpha + l_ij;
+            (m_ij, new_l_i, new_acc)
+        },
+    );
+
+    // Write partials. partial_acc[(q_head, split_id)] is a head_dim row.
+    let out_idx = q_head * num_splits + split_id;
+    let partial_acc_off = out_idx * head_dim + dim_range;
+    store(partial_acc + partial_acc_off, acc_final, dim_mask);
+    store(partial_max + out_idx, m_final);
+    store(partial_sum + out_idx, l_final);
+}
+
+/// **Flash decode attention — Phase 2 (combine splits)**.
+///
+/// Reduces the per-split partial state from Phase 1 into the final output.
+/// Combines via log-sum-exp:
+///   `global_m = max_s(m_s)`
+///   `global_l = sum_s(l_s * exp(m_s - global_m))`
+///   `output[d] = sum_s(acc_s[d] * exp(m_s - global_m)) / global_l`
+///
+/// Launch: grid = (num_q_heads,). One block per Q head; the block
+/// streams over `num_splits` partials. `num_splits <= NUM_SPLITS_TILE`
+/// is required (a constant tile width that bounds shared/register use).
+#[triton_kernel]
+pub fn flash_decode_attn_phase2_f32<
+    const HEAD_DIM: usize,
+    const NUM_SPLITS_TILE: usize,
+>(
+    partial_acc: Ptr<f32>,
+    partial_max: Ptr<f32>,
+    partial_sum: Ptr<f32>,
+    output: Ptr<f32>,
+    num_q_heads: i32,
+    head_dim: i32,
+    num_splits: i32,
+) {
+    let _ = num_q_heads;
+    let q_head = program_id(0);
+
+    let split_range = make_range(0, NUM_SPLITS_TILE as i32);
+    let split_mask = split_range < num_splits;
+
+    let base = q_head * num_splits + split_range;
+    let m_s = load(partial_max + base, split_mask);
+    let l_s = load(partial_sum + base, split_mask);
+
+    let global_m = reduce(m_s, 0, |a, b| max(a, b));
+    let alpha = exp(m_s - global_m);
+    let weighted_l = l_s * alpha;
+    let global_l = reduce(weighted_l, 0, |a, b| a + b);
+
+    let weight = alpha / global_l;
+
+    let dim_range = make_range(0, HEAD_DIM as i32);
+    let dim_mask = dim_range < head_dim;
+    let row_base = base * head_dim;
+    let row_base_2d = expand_dims(row_base, 1);
+    let col_2d = expand_dims(dim_range, 0);
+    let acc_off_2d = row_base_2d + col_2d;
+    let acc_block = load(partial_acc + acc_off_2d);
+
+    let weight_2d = expand_dims(weight, 1);
+    let weighted_acc = weight_2d * acc_block;
+    let out_v = reduce(weighted_acc, 0, |a, b| a + b);
+
+    let out_off = q_head * head_dim + dim_range;
+    store(output + out_off, out_v, dim_mask);
+}

@@ -72,6 +72,33 @@ fn batched_decode_attention_emits_kernel_with_div_rem_for_batch_decompose() {
 }
 
 #[test]
+fn flash_decode_phase1_uses_program_id_axis_1_for_split() {
+    let text = flash_decode_attn_phase1_f32::<128, 32>::mlir();
+    assert!(text.contains("tt.func @flash_decode_attn_phase1_f32("));
+    // 2D grid: program_id(0)=q_head, program_id(1)=split_id.
+    assert!(text.matches("\"tt.get_program_id\"").count() >= 2,
+            "expected ≥2 program_id calls (q_head + split_id):\n{text}");
+    // Same online-softmax inner loop as decode_attention.
+    assert!(text.contains("\"scf.for\""));
+    assert!(text.contains("\"math.exp\""));
+    // 3 stores: partial_acc (vector), partial_max (scalar), partial_sum (scalar).
+    assert!(text.matches("\"tt.store\"").count() >= 3);
+}
+
+#[test]
+fn flash_decode_phase2_combines_via_log_sum_exp() {
+    let text = flash_decode_attn_phase2_f32::<128, 32>::mlir();
+    assert!(text.contains("tt.func @flash_decode_attn_phase2_f32("));
+    // No scf.for — pure tile reduction along NUM_SPLITS_TILE axis.
+    assert!(!text.contains("\"scf.for\""), "phase 2 should be a single-tile reduce, not a loop");
+    // log-sum-exp combine uses exp + multiple reduces.
+    assert!(text.contains("\"math.exp\""));
+    assert!(text.matches("\"tt.reduce\"").count() >= 3,
+            "expected ≥3 reduces (max over splits + sum-of-l + sum-of-acc):\n{text}");
+    assert_eq!(text.matches("\"tt.store\"").count(), 1);
+}
+
+#[test]
 fn paged_decode_attention_emits_block_table_gather() {
     let text = paged_decode_attention_f32::<128, 32>::mlir();
     assert!(text.contains("tt.func @paged_decode_attention_f32("));

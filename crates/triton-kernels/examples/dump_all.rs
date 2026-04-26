@@ -54,6 +54,9 @@ fn main() {
         "fused_add_rms_norm_f16"            => fused_add_rms_norm_f16::<1024>::mlir(),
         "softmax_f16"                       => softmax_f16::<1024>::mlir(),
         "embedding_lookup_f16"              => embedding_lookup_f16::<1024>::mlir(),
+        // Flash decode (split-K) — 2 coordinated kernels.
+        "flash_decode_attn_phase1_f32"      => flash_decode_attn_phase1_f32::<128, 32>::mlir(),
+        "flash_decode_attn_phase2_f32"      => flash_decode_attn_phase2_f32::<128, 32>::mlir(),
     ];
 
     match target {
