@@ -74,6 +74,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Triple.h"
 
 extern "C" {
 
@@ -167,7 +168,7 @@ static void build_ttgir_pipeline(
     using namespace mlir;
     // 1. TTIR → TTGIR conversion. v3.6 takes the Options struct directly
     //    via brace-init (5 fields, see Passes.td).
-    pm.addPass(triton::createConvertTritonToTritonGPUPass(
+    pm.addPass(triton::createConvertTritonToTritonGPU(
         triton::ConvertTritonToTritonGPUOptions{
             /*target=*/std::string("cuda:") + std::to_string(capability),
             /*numWarps=*/opts->num_warps,
@@ -176,8 +177,10 @@ static void build_ttgir_pipeline(
             /*enableSourceRemat=*/false}));
 
     pm.addPass(triton::gpu::createTritonGPUCoalesce());
-    // v3.6 sig change: takes a bool emuTF32 arg (was 0-arg in v3.2).
-    if (capability / 10 >= 8) pm.addPass(triton::gpu::createTritonGPUF32DotTC(/*emuTF32=*/true));
+    // v3.6 takes Options struct.
+    if (capability / 10 >= 8)
+        pm.addPass(triton::gpu::createTritonGPUF32DotTC(
+            triton::gpu::TritonGPUF32DotTCOptions{/*useTF32=*/false}));
 
     // v3.6 sig change: PlanCTAPass no longer takes ClusterInfo*.
     pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUPlanCTAPass());
@@ -212,9 +215,9 @@ static void build_ttgir_pipeline(
     pm.addPass(createSymbolDCEPass());
 
     if (capability / 10 >= 9) {
-        // v3.6 sig change: FenceInsertion now takes capability.
-        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUFenceInsertionPass(capability));
-        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUTMALoweringPass());
+        // v3.6: drop "Pass" suffix; takes capability arg.
+        pm.addPass(triton::gpu::createTritonGPUFenceInsertion());
+        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUTMALowering());
     }
     pm.addPass(createCanonicalizerPass());
 }
@@ -226,21 +229,18 @@ static void build_llir_pipeline(
     int ptx_version)
 {
     using namespace mlir;
-    pm.addPass(triton::NVIDIA::createDecomposeUnsupportedConversionsPass());
+    // v3.6: NVIDIA::createDecomposeUnsupportedConversionsPass dropped —
+    // covered by other passes now.
     pm.addPass(triton::gpu::createTritonGPUCombineTensorSelectAndIf());
-    // v3.6 rename: createConvertSCFToCFPass → createSCFToControlFlowPass.
     pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createConvertIndexToLLVMPass());
-    // v3.6: AllocateSharedMemory moved to NV-specific & takes (cap, ptxv).
-    // Use the NVIDIA backend's allocator instead of the generic one.
-    pm.addPass(triton::gpu::createAllocateSharedMemoryPass());
+    pm.addPass(triton::gpu::createAllocateSharedMemory());
     pm.addPass(triton::createConvertTritonGPUToLLVMPass(capability, ptx_version));
-    pm.addPass(triton::createConvertNVGPUToLLVMPass());
+    pm.addPass(triton::createConvertNVGPUToLLVM());
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
     pm.addPass(createSymbolDCEPass());
-    // v3.6 rename: createLLVMDIScopePass → createLLVMDIScope.
     pm.addPass(createLLVMDIScope());
 }
 
@@ -319,7 +319,7 @@ static std::string llvm_to_ptx(llvm::Module& mod, int capability) {
     if (!tm) throw std::runtime_error("createTargetMachine failed");
 
     mod.setDataLayout(tm->createDataLayout());
-    mod.setTargetTriple(triple);
+    mod.setTargetTriple(llvm::Triple(triple));
 
     llvm::SmallString<0> ptxBuf;
     llvm::raw_svector_ostream os(ptxBuf);
@@ -472,7 +472,7 @@ TritonResult* triton_compile_mlir(
             llvm::CodeGenOptLevel::Aggressive)};
         if (!tm) return make_error("createTargetMachine failed");
         llvm_mod->setDataLayout(tm->createDataLayout());
-        llvm_mod->setTargetTriple(triple);
+        llvm_mod->setTargetTriple(llvm::Triple(triple));
 
         // 4b. Link libdevice (resolves __nv_rsqrtf etc.).
         const char* libdevice_env = std::getenv("TRITON_LIBDEVICE_PATH");
