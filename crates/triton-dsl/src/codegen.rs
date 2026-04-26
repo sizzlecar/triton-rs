@@ -357,28 +357,77 @@ fn maybe_hoist(
     }
 }
 
-/// Detect a Rust integer literal (handling unary minus). Returns the
-/// signed integer value when the expression is a literal we can promote
-/// at IR-build time; `None` otherwise.
-fn lit_int_value(expr: &Expr) -> Option<i64> {
+/// What gets passed to FuncBuilder::lit_i64 / lit_f64 at runtime: a
+/// TokenStream representing the lift value as `i64` or `f64`. Three
+/// cases produce one:
+///
+///   - integer literal:        `pid * 1024`           → `1024i64 as i64`
+///   - float literal:          `xv * 0.5`             → `0.5_f64`
+///   - cast to int / float:    `pid * (BLOCK as i32)` → `(BLOCK as i32) as i64`
+///
+/// The cast case lets users use const-generic params (or any other
+/// integer-typed Rust expression) directly in binary ops without
+/// `const_i32(...)` wrappers — the cast's runtime value gets lifted
+/// against the other operand's element type at IR-build time.
+fn lit_int_lift(expr: &Expr) -> Option<proc_macro2::TokenStream> {
     match expr {
-        Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(li), .. }) => li.base10_parse::<i64>().ok(),
+        // Unwrap parentheses so `(BLOCK as i32)` etc. resolve.
+        Expr::Paren(p) => lit_int_lift(&p.expr),
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(li), .. }) => {
+            let v: i64 = li.base10_parse().ok()?;
+            Some(quote! { (#v) as i64 })
+        }
         Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => {
-            lit_int_value(expr).and_then(|v| v.checked_neg())
+            // Recurse — wraps `-(...)` so negative literals work.
+            let inner = lit_int_lift(expr)?;
+            Some(quote! { -((#inner) as i64) })
+        }
+        Expr::Cast(syn::ExprCast { expr, ty, .. }) => {
+            // Pass through any cast whose target is a primitive integer.
+            let target_ident = primitive_type_name(ty)?;
+            match target_ident.as_str() {
+                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64"
+                | "usize" => {
+                    Some(quote! { ((#expr) as #ty) as i64 })
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
 }
 
-/// Detect a Rust float literal (handling unary minus).
-fn lit_float_value(expr: &Expr) -> Option<f64> {
+fn lit_float_lift(expr: &Expr) -> Option<proc_macro2::TokenStream> {
     match expr {
-        Expr::Lit(syn::ExprLit { lit: syn::Lit::Float(lf), .. }) => lf.base10_parse::<f64>().ok(),
+        Expr::Paren(p) => lit_float_lift(&p.expr),
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Float(lf), .. }) => {
+            let v: f64 = lf.base10_parse().ok()?;
+            Some(quote! { (#v) as f64 })
+        }
         Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => {
-            lit_float_value(expr).map(|v| -v)
+            let inner = lit_float_lift(expr)?;
+            Some(quote! { -((#inner) as f64) })
+        }
+        Expr::Cast(syn::ExprCast { expr, ty, .. }) => {
+            let target_ident = primitive_type_name(ty)?;
+            match target_ident.as_str() {
+                "f32" | "f64" => Some(quote! { ((#expr) as #ty) as f64 }),
+                _ => None,
+            }
         }
         _ => None,
     }
+}
+
+/// Pull a primitive type name out of `syn::Type::Path`. Returns the last
+/// segment's identifier as a String (e.g. `i32`, `f64`).
+fn primitive_type_name(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(tp) = ty {
+        if tp.qself.is_none() {
+            return tp.path.segments.last().map(|s| s.ident.to_string());
+        }
+    }
+    None
 }
 
 /// Translate `a OP b` into a call into `triton_ir::ops::*`, which dispatches
@@ -396,59 +445,54 @@ fn translate_binop(
     hoist: bool,
     counter: &mut u32,
 ) -> Result<TranslatedExpr, syn::Error> {
-    // Lit auto-promotion path: at most one side is a numeric literal.
-    let l_int = lit_int_value(&node.left);
-    let r_int = lit_int_value(&node.right);
-    let l_float = lit_float_value(&node.left);
-    let r_float = lit_float_value(&node.right);
-
-    enum LitSide {
-        None,
-        LeftInt(i64),
-        RightInt(i64),
-        LeftFloat(f64),
-        RightFloat(f64),
+    // Auto-promotion path: at most one side is a numeric literal /
+    // cast-to-primitive that we can lift to a Value via lit_i64 /
+    // lit_f64 at runtime.
+    enum LitSide<T> {
+        Left(T),
+        Right(T),
     }
-    let lit_side = match (l_int, l_float, r_int, r_float) {
-        (_, _, Some(v), _) => LitSide::RightInt(v),
-        (_, _, _, Some(v)) => LitSide::RightFloat(v),
-        (Some(v), _, _, _) => LitSide::LeftInt(v),
-        (_, Some(v), _, _) => LitSide::LeftFloat(v),
-        _ => LitSide::None,
+    enum LitKind {
+        Int(LitSide<proc_macro2::TokenStream>),
+        Float(LitSide<proc_macro2::TokenStream>),
+        None,
+    }
+    // Probe right side first so e.g. `pid * 1024` and `xv + 0.5` (lit on
+    // right, the common case) pick the cheaper lift.
+    let lit = match (lit_int_lift(&node.right), lit_float_lift(&node.right)) {
+        (Some(t), _) => LitKind::Int(LitSide::Right(t)),
+        (_, Some(t)) => LitKind::Float(LitSide::Right(t)),
+        _ => match (lit_int_lift(&node.left), lit_float_lift(&node.left)) {
+            (Some(t), _) => LitKind::Int(LitSide::Left(t)),
+            (_, Some(t)) => LitKind::Float(LitSide::Left(t)),
+            _ => LitKind::None,
+        },
     };
 
-    let lt;
-    let rt;
-    if !matches!(lit_side, LitSide::None) {
-        // Translate the non-literal side; ignore the literal side here
-        // because we'll lift it via lit_i64 / lit_f64 at runtime against
-        // the other operand's type.
-        let other_expr = match lit_side {
-            LitSide::LeftInt(_) | LitSide::LeftFloat(_) => &node.right,
-            LitSide::RightInt(_) | LitSide::RightFloat(_) => &node.left,
-            LitSide::None => unreachable!(),
+    if !matches!(lit, LitKind::None) {
+        let (other_expr, on_left, lit_method, lit_value): (
+            &Expr,
+            bool,
+            proc_macro2::TokenStream,
+            proc_macro2::TokenStream,
+        ) = match lit {
+            LitKind::Int(LitSide::Right(v)) => (&node.left, false, quote!(lit_i64), v),
+            LitKind::Int(LitSide::Left(v)) => (&node.right, true, quote!(lit_i64), v),
+            LitKind::Float(LitSide::Right(v)) => (&node.left, false, quote!(lit_f64), v),
+            LitKind::Float(LitSide::Left(v)) => (&node.right, true, quote!(lit_f64), v),
+            LitKind::None => unreachable!(),
         };
+
         let other_t = translate_expr(other_expr, /*hoist=*/ true, counter)?;
-        let mut setup = other_t.setup;
+        let setup = other_t.setup;
         let other = other_t.expr;
         let method = binop_method(&node.op, &node.span())?;
-
-        let lit_call = match &lit_side {
-            LitSide::LeftInt(v) | LitSide::RightInt(v) => {
-                quote! { __triton_f.lit_i64(&__triton_other, #v as i64) }
-            }
-            LitSide::LeftFloat(v) | LitSide::RightFloat(v) => {
-                quote! { __triton_f.lit_f64(&__triton_other, #v as f64) }
-            }
-            LitSide::None => unreachable!(),
-        };
-        let on_left = matches!(lit_side, LitSide::LeftInt(_) | LitSide::LeftFloat(_));
 
         let body = if on_left {
             quote! {
                 {
                     let __triton_other = #other;
-                    let __triton_lit = #lit_call;
+                    let __triton_lit = __triton_f.#lit_method(&__triton_other, #lit_value);
                     __triton_f.#method(__triton_lit, __triton_other)
                 }
             }
@@ -456,26 +500,18 @@ fn translate_binop(
             quote! {
                 {
                     let __triton_other = #other;
-                    let __triton_lit = #lit_call;
+                    let __triton_lit = __triton_f.#lit_method(&__triton_other, #lit_value);
                     __triton_f.#method(__triton_other, __triton_lit)
                 }
             }
         };
 
-        // Wrap in a hoisting temp if the binary expression sits inside
-        // another call.
-        return Ok(maybe_hoist(
-            std::mem::take(&mut setup),
-            body,
-            CallKind::Value,
-            hoist,
-            counter,
-        ));
+        return Ok(maybe_hoist(setup, body, CallKind::Value, hoist, counter));
     }
 
-    // Standard path: neither side is a literal.
-    lt = translate_expr(&node.left, /*hoist=*/ true, counter)?;
-    rt = translate_expr(&node.right, /*hoist=*/ true, counter)?;
+    // Standard path: neither side is a literal / liftable cast.
+    let lt = translate_expr(&node.left, /*hoist=*/ true, counter)?;
+    let rt = translate_expr(&node.right, /*hoist=*/ true, counter)?;
 
     let mut setup = lt.setup;
     setup.extend(rt.setup);

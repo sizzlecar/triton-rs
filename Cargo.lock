@@ -386,6 +386,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "triton-kernels"
+version = "0.1.0"
+dependencies = [
+ "triton-dsl",
+ "triton-ir",
+]
+
+[[package]]
 name = "triton-runtime"
 version = "0.1.0"
 dependencies = [

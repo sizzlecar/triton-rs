@@ -1,0 +1,12 @@
+[package]
+name = "triton-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Built-in, ready-to-use GPU kernels for triton-rs (LLM inference primitives)"
+
+[dependencies]
+triton-dsl.workspace = true
+triton-ir.workspace = true

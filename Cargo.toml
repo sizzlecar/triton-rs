@@ -6,6 +6,7 @@ members = [
     "crates/triton-ir",
     "crates/triton-dsl",
     "crates/triton-core",
+    "crates/triton-kernels",
 ]
 
 [workspace.package]
@@ -50,6 +51,7 @@ triton-runtime = { path = "crates/triton-runtime", version = "0.1.0" }
 triton-ir      = { path = "crates/triton-ir",      version = "0.1.0" }
 triton-dsl     = { path = "crates/triton-dsl",     version = "0.1.0" }
 triton-core    = { path = "crates/triton-core",    version = "0.1.0" }
+triton-kernels = { path = "crates/triton-kernels", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3
