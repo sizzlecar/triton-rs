@@ -33,8 +33,12 @@ bindgen = "0.70"
 cc = "1.0"
 cmake = "0.1"
 
-# CUDA runtime
-cudarc = { version = "0.13", default-features = false, features = ["std", "cuda-version-from-build-system"] }
+# CUDA runtime — `dynamic-linking` so `cargo check --features cuda` works
+# on Mac (no CUDA at build time). At runtime, libcuda.so is dlopened on
+# the GPU host; on hosts without CUDA, the dlopen fails with a clear
+# error. Phase 1 may switch to `cuda-version-from-build-system` for
+# release builds where static link is preferred.
+cudarc = { version = "0.13", default-features = false, features = ["std", "cuda-version-from-build-system", "driver"] }
 
 # Logging
 tracing = "0.1"

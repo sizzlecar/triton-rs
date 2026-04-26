@@ -19,3 +19,8 @@ xpu  = []           # Phase 6
 thiserror.workspace = true
 tracing.workspace = true
 cudarc = { workspace = true, optional = true }
+
+# `serde_json` is used by the run_vec_add example to parse the metadata
+# JSON Triton emits alongside cubins. Cheap dep, only pulled in when the
+# example/integration paths need it.
+serde_json = "1.0"
