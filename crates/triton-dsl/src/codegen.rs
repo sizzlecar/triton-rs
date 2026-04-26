@@ -826,6 +826,44 @@ fn op_spec_for(
         }
         "reshape_2d" => return Err(arity_err("3 (input, m, n)")),
 
+        // ── element-wise math intrinsics ──
+        // Each takes 1 operand, returns same shape & element type.
+        "exp" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::exp(#(#args),*) },
+        ),
+        "exp2" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::exp2(#(#args),*) },
+        ),
+        "log" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::log(#(#args),*) },
+        ),
+        "log2" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::log2(#(#args),*) },
+        ),
+        "sqrt" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::sqrt(#(#args),*) },
+        ),
+        "sin" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::sin(#(#args),*) },
+        ),
+        "cos" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::cos(#(#args),*) },
+        ),
+        "abs" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::abs(#(#args),*) },
+        ),
+        "exp" | "exp2" | "log" | "log2" | "sqrt" | "sin" | "cos" | "abs" => {
+            return Err(arity_err("1"));
+        }
+
         "return_" if n == 0 => (
             CallKind::Void,
             quote! { ::triton_ir::dialect::tt::return_() },

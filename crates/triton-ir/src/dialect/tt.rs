@@ -203,3 +203,47 @@ pub fn reshape(input: Value, new_shape: Vec<i64>) -> OpSpec {
 pub fn reduce_return(value: Value) -> OpSpec {
     OpSpec::new("tt.reduce.return").with_operand(value)
 }
+
+// ── element-wise math intrinsics (Triton dialect) ───────────────────────
+//
+// All of these are 1-input → 1-output, preserve shape and element type.
+// Triton lowers them to the appropriate libdevice / PTX special-function
+// instructions at codegen. Element type must be one of the float kinds.
+
+fn unary_elementwise(name: &'static str, x: Value) -> OpSpec {
+    let ty = x.ty().clone();
+    OpSpec::new(name).with_operand(x).with_result(ty)
+}
+
+/// `tt.exp` — natural exponential, element-wise.
+pub fn exp(x: Value) -> OpSpec {
+    unary_elementwise("tt.exp", x)
+}
+/// `tt.exp2` — base-2 exponential, element-wise.
+pub fn exp2(x: Value) -> OpSpec {
+    unary_elementwise("tt.exp2", x)
+}
+/// `tt.log` — natural logarithm, element-wise.
+pub fn log(x: Value) -> OpSpec {
+    unary_elementwise("tt.log", x)
+}
+/// `tt.log2` — base-2 logarithm, element-wise.
+pub fn log2(x: Value) -> OpSpec {
+    unary_elementwise("tt.log2", x)
+}
+/// `tt.sqrt` — square root, element-wise.
+pub fn sqrt(x: Value) -> OpSpec {
+    unary_elementwise("tt.sqrt", x)
+}
+/// `tt.sin` — sine, element-wise.
+pub fn sin(x: Value) -> OpSpec {
+    unary_elementwise("tt.sin", x)
+}
+/// `tt.cos` — cosine, element-wise.
+pub fn cos(x: Value) -> OpSpec {
+    unary_elementwise("tt.cos", x)
+}
+/// `tt.abs` — absolute value, element-wise. Works on int and float.
+pub fn abs(x: Value) -> OpSpec {
+    unary_elementwise("tt.abs", x)
+}
