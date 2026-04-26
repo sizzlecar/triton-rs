@@ -357,43 +357,153 @@ fn maybe_hoist(
     }
 }
 
+/// Detect a Rust integer literal (handling unary minus). Returns the
+/// signed integer value when the expression is a literal we can promote
+/// at IR-build time; `None` otherwise.
+fn lit_int_value(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(li), .. }) => li.base10_parse::<i64>().ok(),
+        Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => {
+            lit_int_value(expr).and_then(|v| v.checked_neg())
+        }
+        _ => None,
+    }
+}
+
+/// Detect a Rust float literal (handling unary minus).
+fn lit_float_value(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Float(lf), .. }) => lf.base10_parse::<f64>().ok(),
+        Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => {
+            lit_float_value(expr).map(|v| -v)
+        }
+        _ => None,
+    }
+}
+
 /// Translate `a OP b` into a call into `triton_ir::ops::*`, which dispatches
 /// on the runtime type of `a` to pick the right MLIR op (e.g. `+` becomes
 /// `tt.addptr` for pointer-typed lhs, `arith.addf` for float, otherwise
 /// `arith.addi`). Operands are recursively translated and force-hoisted so
 /// nested binary expressions don't trigger borrow-checker conflicts.
+///
+/// Auto-promotion: if exactly one operand is a Rust integer/float literal,
+/// emit a `__triton_f.lit_i64(&other, lit)` call to lift it to a Value
+/// matching the other operand's type. Lets users write `pid * 1024` and
+/// `xv + 0.5` without sprinkling `const_i32(...)` everywhere.
 fn translate_binop(
     node: &ExprBinary,
     hoist: bool,
     counter: &mut u32,
 ) -> Result<TranslatedExpr, syn::Error> {
-    let lt = translate_expr(&node.left, /*hoist=*/ true, counter)?;
-    let rt = translate_expr(&node.right, /*hoist=*/ true, counter)?;
+    // Lit auto-promotion path: at most one side is a numeric literal.
+    let l_int = lit_int_value(&node.left);
+    let r_int = lit_int_value(&node.right);
+    let l_float = lit_float_value(&node.left);
+    let r_float = lit_float_value(&node.right);
+
+    enum LitSide {
+        None,
+        LeftInt(i64),
+        RightInt(i64),
+        LeftFloat(f64),
+        RightFloat(f64),
+    }
+    let lit_side = match (l_int, l_float, r_int, r_float) {
+        (_, _, Some(v), _) => LitSide::RightInt(v),
+        (_, _, _, Some(v)) => LitSide::RightFloat(v),
+        (Some(v), _, _, _) => LitSide::LeftInt(v),
+        (_, Some(v), _, _) => LitSide::LeftFloat(v),
+        _ => LitSide::None,
+    };
+
+    let lt;
+    let rt;
+    if !matches!(lit_side, LitSide::None) {
+        // Translate the non-literal side; ignore the literal side here
+        // because we'll lift it via lit_i64 / lit_f64 at runtime against
+        // the other operand's type.
+        let other_expr = match lit_side {
+            LitSide::LeftInt(_) | LitSide::LeftFloat(_) => &node.right,
+            LitSide::RightInt(_) | LitSide::RightFloat(_) => &node.left,
+            LitSide::None => unreachable!(),
+        };
+        let other_t = translate_expr(other_expr, /*hoist=*/ true, counter)?;
+        let mut setup = other_t.setup;
+        let other = other_t.expr;
+        let method = binop_method(&node.op, &node.span())?;
+
+        let lit_call = match &lit_side {
+            LitSide::LeftInt(v) | LitSide::RightInt(v) => {
+                quote! { __triton_f.lit_i64(&__triton_other, #v as i64) }
+            }
+            LitSide::LeftFloat(v) | LitSide::RightFloat(v) => {
+                quote! { __triton_f.lit_f64(&__triton_other, #v as f64) }
+            }
+            LitSide::None => unreachable!(),
+        };
+        let on_left = matches!(lit_side, LitSide::LeftInt(_) | LitSide::LeftFloat(_));
+
+        let body = if on_left {
+            quote! {
+                {
+                    let __triton_other = #other;
+                    let __triton_lit = #lit_call;
+                    __triton_f.#method(__triton_lit, __triton_other)
+                }
+            }
+        } else {
+            quote! {
+                {
+                    let __triton_other = #other;
+                    let __triton_lit = #lit_call;
+                    __triton_f.#method(__triton_other, __triton_lit)
+                }
+            }
+        };
+
+        // Wrap in a hoisting temp if the binary expression sits inside
+        // another call.
+        return Ok(maybe_hoist(
+            std::mem::take(&mut setup),
+            body,
+            CallKind::Value,
+            hoist,
+            counter,
+        ));
+    }
+
+    // Standard path: neither side is a literal.
+    lt = translate_expr(&node.left, /*hoist=*/ true, counter)?;
+    rt = translate_expr(&node.right, /*hoist=*/ true, counter)?;
 
     let mut setup = lt.setup;
     setup.extend(rt.setup);
     let l = lt.expr;
     let r = rt.expr;
 
-    // Emit as a method call on __triton_f so Rust's method-call
-    // auto-reborrow handles both contexts: top-level FuncBuilder values
-    // and closure-parameter `&mut FuncBuilder` references inside scf_for
-    // bodies. Free-function dispatch (ops::add(&mut __triton_f, ...))
-    // would type-mismatch in the closure context.
-    let method = match node.op {
-        BinOp::Add(_) => quote! { add },
-        BinOp::Sub(_) => quote! { sub },
-        BinOp::Mul(_) => quote! { mul },
-        BinOp::Div(_) => quote! { div },
-        BinOp::Lt(_) => quote! { lt },
-        BinOp::Le(_) => quote! { le },
-        BinOp::Gt(_) => quote! { gt },
-        BinOp::Ge(_) => quote! { ge },
-        BinOp::Eq(_) => quote! { eq },
-        BinOp::Ne(_) => quote! { ne },
+    let method = binop_method(&node.op, &node.op.span())?;
+    let call_expr = quote! { __triton_f.#method(#l, #r) };
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
+}
+
+/// Map a syn BinOp to the corresponding FuncBuilder method name. Returns
+/// an error for unsupported operators with a span pointing at the offender.
+fn binop_method(op: &BinOp, span: &Span) -> Result<proc_macro2::Ident, syn::Error> {
+    let name = match op {
+        BinOp::Add(_) => "add",
+        BinOp::Sub(_) => "sub",
+        BinOp::Mul(_) => "mul",
+        BinOp::Div(_) => "div",
+        BinOp::Lt(_) => "lt",
+        BinOp::Le(_) => "le",
+        BinOp::Gt(_) => "gt",
+        BinOp::Ge(_) => "ge",
+        BinOp::Eq(_) => "eq",
+        BinOp::Ne(_) => "ne",
         other => {
             return Err(syn::Error::new(
-                node.op.span(),
+                *span,
                 format!(
                     "binary operator `{:?}` is not supported in #[triton_kernel] body \
                      (supported: `+ - * / < <= > >= == !=`)",
@@ -402,9 +512,7 @@ fn translate_binop(
             ));
         }
     };
-
-    let call_expr = quote! { __triton_f.#method(#l, #r) };
-    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
+    Ok(format_ident!("{}", name))
 }
 
 fn translate_call(

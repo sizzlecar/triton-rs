@@ -448,6 +448,48 @@ impl<'m> FuncBuilder<'m> {
         crate::ops::ne(self, a, b)
     }
 
+    /// Build a Value from a Rust integer literal that matches `sample`'s
+    /// element type. Used by the DSL's auto-promotion: when the proc-macro
+    /// sees `pid * 1024`, it lifts the literal to a Value via this helper
+    /// before calling `mul`. The element type of the result follows
+    /// `sample`'s element type (`I32` / `I64` / `F32`); shape coercion to
+    /// tensor happens in the binary op via `coerce_elemwise`.
+    pub fn lit_i64(&mut self, sample: &Value, lit: i64) -> Value {
+        let elem = match sample.ty() {
+            Type::Tensor { elem, .. } => (**elem).clone(),
+            other => other.clone(),
+        };
+        match elem {
+            Type::I32 => self.op_one(crate::dialect::arith::constant_i32(lit as i32)),
+            Type::I64 => self.op_one(crate::dialect::arith::constant_i64(lit)),
+            Type::F32 => self.op_one(crate::dialect::arith::constant_f32(lit as f32)),
+            other => panic!(
+                "lit_i64: cannot lift integer literal to type {} (sample type was {})",
+                other,
+                sample.ty()
+            ),
+        }
+    }
+
+    /// Build a Value from a Rust float literal matching `sample`'s
+    /// element type. Float literals can only land in float types.
+    pub fn lit_f64(&mut self, sample: &Value, lit: f64) -> Value {
+        let elem = match sample.ty() {
+            Type::Tensor { elem, .. } => (**elem).clone(),
+            other => other.clone(),
+        };
+        match elem {
+            Type::F16 | Type::F32 | Type::BF16 => {
+                self.op_one(crate::dialect::arith::constant_f32(lit as f32))
+            }
+            other => panic!(
+                "lit_f64: cannot lift float literal to type {} (sample type was {})",
+                other,
+                sample.ty()
+            ),
+        }
+    }
+
     /// Commit the function to its parent module.
     pub fn finish(mut self) {
         self.committed = true;
