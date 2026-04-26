@@ -50,6 +50,9 @@ pub mod prelude {
     pub use crate::embedding::embedding_lookup_f32;
     pub use crate::norms::{fused_add_rms_norm_f32, layer_norm_f32, rms_norm_f32};
     pub use crate::positional::{rope_full_f32, rope_k_f32, rope_q_f32};
-    pub use crate::projection::{split_qkv_f32, transpose_head_to_token_f32};
+    pub use crate::projection::{
+        qk_norm_rope_transpose_f32, rope_transpose_f32, split_qkv_f32,
+        transpose_head_to_token_f32, transpose_token_to_head_f32,
+    };
     pub use crate::reduction::{cross_entropy_forward_f32, softmax_f32};
 }

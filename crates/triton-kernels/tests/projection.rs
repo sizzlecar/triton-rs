@@ -25,3 +25,39 @@ fn transpose_uses_pid_decode_and_one_load_one_store() {
     assert_eq!(text.matches("\"tt.load\"").count(), 1);
     assert_eq!(text.matches("\"tt.store\"").count(), 1);
 }
+
+#[test]
+fn transpose_token_to_head_inverse_layout() {
+    let text = transpose_token_to_head_f32::<128>::mlir();
+    assert!(text.contains("tt.func @transpose_token_to_head_f32("));
+    assert!(text.contains("\"arith.divsi\""));
+    assert!(text.contains("\"arith.remsi\""));
+}
+
+#[test]
+fn qk_norm_rope_transpose_combines_norm_rope_transpose() {
+    let text = qk_norm_rope_transpose_f32::<128, 64>::mlir();
+    assert!(text.contains("tt.func @qk_norm_rope_transpose_f32("));
+    // Norm pass: reduce + rsqrt.
+    assert!(text.contains("\"tt.reduce\""), "missing tt.reduce for norm:\n{text}");
+    assert!(text.contains("\"math.rsqrt\""));
+    // RoPE pass: 4 element-wise float ops (mul/sub/mul/add).
+    assert!(text.contains("\"arith.subf\""), "missing subf for rope:\n{text}");
+    // Norm load + 2 cos/sin + norm_w lo/hi + x0/x1 = 7 loads;
+    // 2 stores (lo + hi half).
+    let loads = text.matches("\"tt.load\"").count();
+    assert!(loads >= 6, "expected at least 6 loads (norm tile + cos + sin + nw lo/hi + x0/x1), got {loads}:\n{text}");
+    assert_eq!(text.matches("\"tt.store\"").count(), 2);
+}
+
+#[test]
+fn rope_transpose_skips_norm_path() {
+    let text = rope_transpose_f32::<64>::mlir();
+    assert!(text.contains("tt.func @rope_transpose_f32("));
+    // No reduce / rsqrt — this kernel skips the QK-norm.
+    assert!(!text.contains("\"tt.reduce\""), "rope_transpose should NOT have reduce:\n{text}");
+    assert!(!text.contains("\"math.rsqrt\""), "rope_transpose should NOT have rsqrt:\n{text}");
+    // 4 loads (cos, sin, x0, x1), 2 stores.
+    assert_eq!(text.matches("\"tt.load\"").count(), 4);
+    assert_eq!(text.matches("\"tt.store\"").count(), 2);
+}

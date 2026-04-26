@@ -468,6 +468,10 @@ impl<'m> FuncBuilder<'m> {
             Type::I32 => self.op_one(crate::dialect::arith::constant_i32(lit as i32)),
             Type::I64 => self.op_one(crate::dialect::arith::constant_i64(lit)),
             Type::F32 => self.op_one(crate::dialect::arith::constant_f32(lit as f32)),
+            // Pointer + int literal → the literal is the offset for
+            // tt.addptr, which always wants i32. Don't try to lift the
+            // literal to be a pointer-typed value.
+            Type::Ptr(_) => self.op_one(crate::dialect::arith::constant_i32(lit as i32)),
             other => panic!(
                 "lit_i64: cannot lift integer literal to type {} (sample type was {})",
                 other,
