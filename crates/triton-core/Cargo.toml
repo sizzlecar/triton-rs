@@ -21,3 +21,7 @@ triton-ir.workspace = true
 triton-runtime.workspace = true
 triton-sys.workspace = true
 triton-dsl.workspace = true
+
+# Examples — not part of the public dep tree of consumers.
+[dev-dependencies]
+cudarc = { workspace = true }
