@@ -55,8 +55,11 @@ echo "== [3/3] launch on GPU via cudarc =="
 case "${RUNNER:-auto}" in
     auto)
         case "$EXAMPLE" in
-            ferrum_gelu) RUNNER=run_gelu ;;
-            *)           RUNNER=run_vec_add ;;
+            ferrum_gelu)                 RUNNER=run_gelu ;;
+            ferrum_residual_add_inplace) RUNNER=run_residual_add_inplace ;;
+            ferrum_add_bias)             RUNNER=run_add_bias ;;
+            ferrum_rms_norm)             RUNNER=run_rms_norm ;;
+            *)                           RUNNER=run_vec_add ;;
         esac
         ;;
 esac
