@@ -17,8 +17,8 @@
 
 set -euo pipefail
 
-TRITON_TAG="${TRITON_TAG:-v3.6.0}"          # ARCHITECTURE.md §2.2 pin
-TRITON_COMMIT="${TRITON_COMMIT:-}"          # informational; empty = accept whatever the tag resolves to
+TRITON_TAG="${TRITON_TAG:-v3.2.0}"          # bump candidate: v3.6.0 (ARCHITECTURE.md target)
+TRITON_COMMIT="${TRITON_COMMIT:-9641643}"   # truncated SHA — informational
 TRITON_REPO="${TRITON_REPO:-https://github.com/triton-lang/triton}"
 
 # Resolve the vendor dir relative to this script's location so the script
@@ -29,16 +29,11 @@ VENDOR_DIR="${SCRIPT_DIR}/../vendor/triton"
 if [[ -d "$VENDOR_DIR/.git" ]]; then
     cd "$VENDOR_DIR"
     HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo "")"
-    HEAD_TAG="$(git describe --tags --exact-match 2>/dev/null || echo "")"
-    if [[ -n "$TRITON_COMMIT" && "$HEAD_SHA" == "${TRITON_COMMIT}"* ]]; then
+    if [[ "$HEAD_SHA" == "${TRITON_COMMIT}"* ]]; then
         echo "vendor/triton already at ${TRITON_TAG} (${HEAD_SHA:0:7}); nothing to do"
         exit 0
     fi
-    if [[ -z "$TRITON_COMMIT" && "$HEAD_TAG" == "$TRITON_TAG" ]]; then
-        echo "vendor/triton already at ${TRITON_TAG} (${HEAD_SHA:0:7}); nothing to do"
-        exit 0
-    fi
-    echo "vendor/triton exists at ${HEAD_SHA:0:7} (tag=${HEAD_TAG:-none}); want ${TRITON_TAG}, re-cloning"
+    echo "vendor/triton exists but at ${HEAD_SHA:0:7}, expected ${TRITON_COMMIT}*; re-cloning"
     cd - >/dev/null
     rm -rf "$VENDOR_DIR"
 fi
