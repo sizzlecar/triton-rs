@@ -2,9 +2,11 @@
 **/*.rs.bk
 Cargo.lock.bak
 
-# Vendored Triton build artifacts
-crates/triton-sys/vendor/triton/build
-crates/triton-sys/vendor/triton/python/build
+# Vendored Triton source — fetched on demand by `crates/triton-sys/tools/fetch_vendor.sh`.
+# Pinned to v3.2.0 (commit 9641643). NOT committed to keep the repo small;
+# contributors run the fetch script (or `cargo build --features compile-triton`
+# triggers it via build.rs).
+crates/triton-sys/vendor/triton/
 
 # bindgen output
 crates/triton-sys/src/bindings.rs
