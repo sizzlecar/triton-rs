@@ -356,10 +356,18 @@ impl<'m> FuncBuilder<'m> {
     // via `tt.splat`, so users can write `tensor + scalar` (or `ptr + i32`
     // — even works for tt.addptr) without sprinkling splat_1d everywhere.
 
-    /// Coerce a scalar/tensor pair into matching shapes for an element-wise
-    /// op: if exactly one side is a tensor, splat the scalar to its shape.
-    /// Same-shape inputs pass through. Two tensors with mismatched shapes
-    /// are a logic error and panic — no rank-broadcast for now.
+    /// Coerce a (scalar | tensor) pair into matching shapes for element-wise
+    /// ops:
+    ///
+    /// 1. **Scalar + tensor** — splat the scalar to the tensor's shape.
+    /// 2. **Tensor + tensor with same shape** — pass through.
+    /// 3. **Tensor + tensor with singleton-broadcastable shapes** — emit
+    ///    `tt.broadcast` on each side to the common max-shape (e.g.
+    ///    `[32, 1]` and `[1, 128]` broadcast to `[32, 128]`). Required by
+    ///    the attention kernel's outer-add of `pos_range[:, None] +
+    ///    dim_range[None, :]`.
+    /// 4. **Tensor + tensor with mismatched non-1 dims** — panic; this is
+    ///    almost certainly a kernel bug, not an intended broadcast.
     fn coerce_elemwise(&mut self, a: Value, b: Value) -> (Value, Value) {
         let a_t = matches!(a.ty(), Type::Tensor { .. });
         let b_t = matches!(b.ty(), Type::Tensor { .. });
@@ -381,6 +389,52 @@ impl<'m> FuncBuilder<'m> {
                 };
                 let a_splat = self.op_one(crate::dialect::tt::splat(a, shape));
                 (a_splat, b)
+            }
+            (true, true) => {
+                let (sa, sb) = match (a.ty(), b.ty()) {
+                    (Type::Tensor { shape: sa, .. }, Type::Tensor { shape: sb, .. }) => {
+                        (sa.clone(), sb.clone())
+                    }
+                    _ => unreachable!(),
+                };
+                if sa == sb {
+                    return (a, b);
+                }
+                // Singleton-broadcast: ranks must match (caller used
+                // expand_dims to align). For each dim, both sides must be
+                // either equal or one of them must be 1; broadcast the 1.
+                if sa.len() != sb.len() {
+                    panic!(
+                        "elemwise rank mismatch: {} vs {} (lift a singleton dim with `expand_dims` first)",
+                        a.ty(),
+                        b.ty()
+                    );
+                }
+                let target: Vec<i64> = sa
+                    .iter()
+                    .zip(sb.iter())
+                    .map(|(&da, &db)| match (da, db) {
+                        (x, y) if x == y => x,
+                        (1, y) => y,
+                        (x, 1) => x,
+                        _ => panic!(
+                            "elemwise non-broadcastable shapes: {} vs {}",
+                            a.ty(),
+                            b.ty()
+                        ),
+                    })
+                    .collect();
+                let a_b = if sa == target {
+                    a
+                } else {
+                    self.op_one(crate::dialect::tt::broadcast(a, target.clone()))
+                };
+                let b_b = if sb == target {
+                    b
+                } else {
+                    self.op_one(crate::dialect::tt::broadcast(b, target))
+                };
+                (a_b, b_b)
             }
             _ => (a, b),
         }
