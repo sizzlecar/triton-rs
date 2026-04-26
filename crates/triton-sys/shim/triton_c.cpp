@@ -110,7 +110,7 @@ TritonContext* triton_context_create(void) {
 
 void triton_context_destroy(TritonContext* ctx) { delete ctx; }
 
-const char* triton_get_version(void) { return "v3.2.0"; }
+const char* triton_get_version(void) { return "v3.6.0"; }
 
 // ── result helpers ────────────────────────────────────────────────
 static char* dup_cstr(const std::string& s) {
