@@ -11,11 +11,26 @@
 set -euo pipefail
 
 EXAMPLE="${1:-dump_vec_add_generic}"
-DTYPE="${2:-}"
+DTYPE=""
+OP="add"
 ARCH=89
-if [[ "${3:-}" == "--arch" ]]; then
-    ARCH="$4"
-fi
+shift || true
+while (( $# > 0 )); do
+    case "$1" in
+        --op) OP="$2"; shift 2 ;;
+        --arch) ARCH="$2"; shift 2 ;;
+        --dtype) DTYPE="$2"; shift 2 ;;
+        *)
+            # First positional after example is treated as dtype when no flag
+            # was used (back-compat with the old `run_e2e.sh ferrum_residual_add f32` form).
+            if [[ -z "$DTYPE" && "$1" != --* ]]; then
+                DTYPE="$1"; shift
+            else
+                echo "unknown arg: $1" >&2; exit 2
+            fi
+            ;;
+    esac
+done
 
 OUT="/tmp/triton_rs_e2e_${EXAMPLE}"
 rm -rf "$OUT"
@@ -37,6 +52,6 @@ python3 tools/mlir_to_cubin.py "$OUT/kernel.mlir" "$OUT" --arch "$ARCH"
 
 echo "== [3/3] launch on GPU via cudarc =="
 cargo run --quiet --example run_vec_add -p triton-runtime --features cuda --release -- \
-    "$OUT/kernel.ptx" "$OUT/kernel.json"
+    "$OUT/kernel.ptx" "$OUT/kernel.json" --op "$OP"
 
 echo "== DONE =="

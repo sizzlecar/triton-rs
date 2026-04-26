@@ -31,10 +31,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let ptx_path = args
         .next()
-        .ok_or("usage: run_vec_add PTX_PATH METADATA_JSON_PATH")?;
+        .ok_or("usage: run_vec_add PTX_PATH METADATA_JSON_PATH [--op add|silu_mul|mul]")?;
     let meta_path = args
         .next()
-        .ok_or("usage: run_vec_add PTX_PATH METADATA_JSON_PATH")?;
+        .ok_or("usage: run_vec_add PTX_PATH METADATA_JSON_PATH [--op add|silu_mul|mul]")?;
+    let op_kind = match args.next().as_deref() {
+        None => "add".to_string(),
+        Some("--op") => args.next().unwrap_or_else(|| "add".to_string()),
+        Some(other) => return Err(format!("unexpected positional arg `{other}`").into()),
+    };
 
     // 1. Load the metadata so we know the kernel name and launch shape.
     let meta_text = std::fs::read_to_string(&meta_path)?;
@@ -95,21 +100,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Copy back and verify against the host reference.
     let host_out = dev.dtoh_sync_copy(&dev_out)?;
 
+    let reference = |a: f32, b: f32| -> f32 {
+        match op_kind.as_str() {
+            "add" => a + b,
+            "mul" => a * b,
+            // SiLU(a) * b where SiLU(x) = x / (1 + exp(-x)).
+            "silu_mul" => (a / (1.0 + (-a).exp())) * b,
+            other => panic!("unknown --op `{other}` (supported: add, mul, silu_mul)"),
+        }
+    };
+
     let mut max_err = 0f32;
     let mut first_bad: Option<(usize, f32, f32)> = None;
     for i in 0..N {
-        let expected = host_x[i] + host_y[i];
+        let expected = reference(host_x[i], host_y[i]);
         let err = (host_out[i] - expected).abs();
+        // Allow a small relative tolerance for nonlinear ops (exp/log/etc.
+        // round-tripping through float32). 1e-4 covers typical SiLU error.
+        let tol = (1e-5_f32).max(expected.abs() * 1e-5);
         if err > max_err {
             max_err = err;
         }
-        if err > 1e-5 && first_bad.is_none() {
+        if err > tol && first_bad.is_none() {
             first_bad = Some((i, host_out[i], expected));
         }
     }
 
     println!(
-        "vec_add: N={N} BLOCK={BLOCK} num_warps={num_warps} max_err={max_err}"
+        "kernel={kernel_name} op={op_kind} N={N} BLOCK={BLOCK} num_warps={num_warps} max_err={max_err}"
     );
     if let Some((i, got, want)) = first_bad {
         eprintln!("MISMATCH at i={i}: got {got}, want {want}");
