@@ -166,7 +166,9 @@ static void build_ttgir_pipeline(
     pm.addPass(triton::gpu::createTritonGPUOptimizeThreadLocality());
     pm.addPass(triton::gpu::createTritonGPUAccelerateMatmul());
     pm.addPass(triton::gpu::createTritonGPURemoveLayoutConversions());
-    pm.addPass(triton::gpu::createTritonGPUOptimizeDotOperands(capability >= 80));
+    pm.addPass(triton::gpu::createTritonGPUOptimizeDotOperands(
+        triton::gpu::TritonGPUOptimizeDotOperandsOptions{
+            /*hoistLayoutConversion=*/capability >= 80}));
     pm.addPass(createCSEPass());
 
     if (capability / 10 >= 8) {
@@ -175,11 +177,15 @@ static void build_ttgir_pipeline(
         // Warp-specialization passes — only effective when
         // num_consumer_groups > 0 (default 0). We omit them for the
         // initial Phase 1C; flash-attention may need them later.
-        pm.addPass(triton::gpu::createTritonGPUPipeline(opts->num_stages));
+        pm.addPass(triton::gpu::createTritonGPUPipeline(
+            triton::gpu::TritonGPUPipelineOptions{
+                /*numStages=*/static_cast<int32_t>(opts->num_stages)}));
     }
 
     pm.addPass(triton::gpu::createTritonGPUPrefetch());
-    pm.addPass(triton::gpu::createTritonGPUOptimizeDotOperands(capability >= 80));
+    pm.addPass(triton::gpu::createTritonGPUOptimizeDotOperands(
+        triton::gpu::TritonGPUOptimizeDotOperandsOptions{
+            /*hoistLayoutConversion=*/capability >= 80}));
     pm.addPass(triton::gpu::createTritonGPURemoveLayoutConversions());
     pm.addPass(triton::gpu::createTritonGPUReduceDataDuplication());
     pm.addPass(triton::gpu::createTritonGPUReorderInstructions());

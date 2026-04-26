@@ -221,12 +221,20 @@ mod compile_triton {
             .include(vendor_dir.join("third_party"))
             .include(vendor_dir.join("third_party/nvidia/include"))
             // Tablegen outputs land under triton-build/build/{include,third_party/...}.
+            // NVIDIA backend headers do `#include "nvidia/include/Dialect/...h.inc"`
+            // — that requires the *parent* of nvidia/ on the include path
+            // for both source-side and build-side trees.
             .include(triton_build.join("build/include"))
+            .include(triton_build.join("build")) // resolves "third_party/nvidia/..." paths
+            .include(triton_build.join("build/third_party"))
             .include(triton_build.join("build/third_party/nvidia/include"))
             .include(llvm_root.join("include"))
             .flag("-std=c++17")
             .flag("-fPIC")
-            .flag("-fno-exceptions") // match LLVM/MLIR convention
+            // Triton's C++ shim wraps every FFI call in try/catch (so
+            // exceptions don't cross the C ABI). MLIR/LLVM libs are
+            // exception-free internally, but we keep -fexceptions on the
+            // shim so its own try/catch compiles. -fno-rtti stays.
             .flag("-fno-rtti");
         build.compile("triton_c");
 
