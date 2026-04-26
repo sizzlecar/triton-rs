@@ -611,8 +611,18 @@ impl<'m> FuncBuilder<'m> {
             other => other.clone(),
         };
         match elem {
-            Type::F16 | Type::F32 | Type::BF16 => {
-                self.op_one(crate::dialect::arith::constant_f32(lit as f32))
+            Type::F32 => self.op_one(crate::dialect::arith::constant_f32(lit as f32)),
+            // For f16/bf16: build a f32 constant then truncf — `arith.constant`
+            // can take f16/bf16 attributes but our printer's Attr::f32 helper
+            // is f32-only, and the truncf pass-through is what Python Triton
+            // does anyway for literal lifting in mixed-precision kernels.
+            Type::F16 => {
+                let c = self.op_one(crate::dialect::arith::constant_f32(lit as f32));
+                self.op_one(crate::dialect::arith::truncf(c, Type::F16))
+            }
+            Type::BF16 => {
+                let c = self.op_one(crate::dialect::arith::constant_f32(lit as f32));
+                self.op_one(crate::dialect::arith::truncf(c, Type::BF16))
             }
             other => panic!(
                 "lit_f64: cannot lift float literal to type {} (sample type was {})",

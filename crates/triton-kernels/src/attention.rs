@@ -816,5 +816,9 @@ pub fn flash_attn_full<
     let out_row_base = q_pos_range * head_dim + q_batch_base;
     let out_row_2d = expand_dims(out_row_base, 1);
     let out_off_2d = out_row_2d + dim_2d;
-    store(output + out_off_2d, out_v, dim_mask);
+    // v0: assume head_dim==HEAD_DIM so the per-column mask is unused;
+    // emitting a 1D mask on a 2D ptr trips Triton's verifier. Real
+    // partial-head masking needs a 2D broadcast of dim_mask.
+    let _ = dim_mask;
+    store(output + out_off_2d, out_v);
 }
