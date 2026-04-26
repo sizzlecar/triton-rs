@@ -356,11 +356,15 @@ impl<'m> FuncBuilder<'m> {
     // via `tt.splat`, so users can write `tensor + scalar` (or `ptr + i32`
     // — even works for tt.addptr) without sprinkling splat_1d everywhere.
 
-    /// Coerce a (scalar | tensor) pair into matching shapes for element-wise
-    /// ops:
+    /// Coerce a (scalar | tensor) pair into matching shapes AND elem types
+    /// for element-wise ops:
     ///
-    /// 1. **Scalar + tensor** — splat the scalar to the tensor's shape.
-    /// 2. **Tensor + tensor with same shape** — pass through.
+    /// 1. **Scalar + tensor** — cast the scalar's elem to the tensor's elem
+    ///    (truncf / extf / sitofp / etc. via `cast_with_elem`), then splat
+    ///    to the tensor's shape. Mirrors Python @triton.jit's implicit
+    ///    behavior: `f16_tensor * 2.0_f32` → the f32 literal silently
+    ///    truncates to f16 to match the tensor.
+    /// 2. **Tensor + tensor with same shape and elem type** — pass through.
     /// 3. **Tensor + tensor with singleton-broadcastable shapes** — emit
     ///    `tt.broadcast` on each side to the common max-shape (e.g.
     ///    `[32, 1]` and `[1, 128]` broadcast to `[32, 128]`). Required by
@@ -373,21 +377,34 @@ impl<'m> FuncBuilder<'m> {
         let b_t = matches!(b.ty(), Type::Tensor { .. });
         match (a_t, b_t) {
             (true, false) => {
-                let shape = if let Type::Tensor { shape, .. } = a.ty() {
-                    shape.clone()
+                let (shape, a_elem) = if let Type::Tensor { shape, elem } = a.ty() {
+                    (shape.clone(), (**elem).clone())
                 } else {
                     unreachable!()
                 };
-                let b_splat = self.op_one(crate::dialect::tt::splat(b, shape));
+                // Only cast when both sides are arithmetic — for pointer
+                // tensors (`tensor<!tt.ptr<T>>`), the scalar is an offset
+                // (i32) that tt.addptr handles after splat without a cast.
+                let b_cast = if is_arith_elem(&a_elem) && is_arith_elem(&b.ty()) {
+                    self.cast_with_elem(b, a_elem)
+                } else {
+                    b
+                };
+                let b_splat = self.op_one(crate::dialect::tt::splat(b_cast, shape));
                 (a, b_splat)
             }
             (false, true) => {
-                let shape = if let Type::Tensor { shape, .. } = b.ty() {
-                    shape.clone()
+                let (shape, b_elem) = if let Type::Tensor { shape, elem } = b.ty() {
+                    (shape.clone(), (**elem).clone())
                 } else {
                     unreachable!()
                 };
-                let a_splat = self.op_one(crate::dialect::tt::splat(a, shape));
+                let a_cast = if is_arith_elem(&b_elem) && is_arith_elem(&a.ty()) {
+                    self.cast_with_elem(a, b_elem)
+                } else {
+                    a
+                };
+                let a_splat = self.op_one(crate::dialect::tt::splat(a_cast, shape));
                 (a_splat, b)
             }
             (true, true) => {
@@ -643,6 +660,15 @@ impl<'m> FuncBuilder<'m> {
             body: std::mem::take(&mut self.body),
         });
     }
+}
+
+/// True when `t` (or its tensor element) is an arithmetic dtype that
+/// `cast_with_elem` knows how to convert. Pointers, indexes, and other
+/// non-numeric types return false — those skip the auto-cast that
+/// `coerce_elemwise` does on scalar+tensor pairs (which would otherwise
+/// mis-cast offsets in pointer arithmetic).
+fn is_arith_elem(t: &Type) -> bool {
+    is_int_elem(t) || is_float_elem(t)
 }
 
 fn is_int_elem(t: &Type) -> bool {
