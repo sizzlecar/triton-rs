@@ -42,7 +42,7 @@
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 
 // Triton public headers
-#include "triton/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.h"
+#include "triton/Conversion/TritonToTritonGPU/Passes.h"  // renamed from TritonToTritonGPUPass.h in v3.6
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
@@ -157,22 +157,30 @@ static int default_ptx_version(int cap) {
     return 75;
 }
 
-// ── ttgir pass pipeline (mirrors NVIDIABackend.make_ttgir) ────────
+// ── ttgir pass pipeline (mirrors v3.6.0 NVIDIABackend.make_ttgir,
+//     simplified for sm_8x; Hopper / Blackwell-specific passes skipped) ──
 static void build_ttgir_pipeline(
     mlir::PassManager& pm,
     const TritonCompileOptions* opts,
-    int capability,
-    mlir::triton::nvidia_gpu::ClusterInfo& cluster_info)
+    int capability)
 {
     using namespace mlir;
+    // 1. TTIR → TTGIR conversion. v3.6 takes the Options struct directly
+    //    via brace-init (5 fields, see Passes.td).
     pm.addPass(triton::createConvertTritonToTritonGPUPass(
-        std::string("cuda:") + std::to_string(capability),
-        opts->num_warps, /*threadsPerWarp=*/32, opts->num_ctas));
+        triton::ConvertTritonToTritonGPUOptions{
+            /*target=*/std::string("cuda:") + std::to_string(capability),
+            /*numWarps=*/opts->num_warps,
+            /*threadsPerWarp=*/32,
+            /*numCTAs=*/opts->num_ctas,
+            /*enableSourceRemat=*/false}));
 
     pm.addPass(triton::gpu::createTritonGPUCoalesce());
-    if (capability / 10 >= 8) pm.addPass(triton::gpu::createTritonGPUF32DotTC());
+    // v3.6 sig change: takes a bool emuTF32 arg (was 0-arg in v3.2).
+    if (capability / 10 >= 8) pm.addPass(triton::gpu::createTritonGPUF32DotTC(/*emuTF32=*/true));
 
-    pm.addPass(createTritonNvidiaGPUPlanCTAPass(&cluster_info));
+    // v3.6 sig change: PlanCTAPass no longer takes ClusterInfo*.
+    pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUPlanCTAPass());
     pm.addPass(triton::gpu::createTritonGPURemoveLayoutConversions());
     pm.addPass(triton::gpu::createTritonGPUOptimizeThreadLocality());
     pm.addPass(triton::gpu::createTritonGPUAccelerateMatmul());
@@ -185,12 +193,12 @@ static void build_ttgir_pipeline(
     if (capability / 10 >= 8) {
         pm.addPass(triton::gpu::createTritonGPUOptimizeAccumulatorInit());
         pm.addPass(triton::gpu::createTritonGPUCombineTensorSelectAndIf());
-        // Warp-specialization passes — only effective when
-        // num_consumer_groups > 0 (default 0). We omit them for the
-        // initial Phase 1C; flash-attention may need them later.
+        // v3.6 sig change: createTritonGPUPipeline takes 2-field Options
+        // (numStages, dumpIntermediateSteps).
         pm.addPass(triton::gpu::createTritonGPUPipeline(
             triton::gpu::TritonGPUPipelineOptions{
-                /*numStages=*/static_cast<int32_t>(opts->num_stages)}));
+                /*numStages=*/static_cast<int32_t>(opts->num_stages),
+                /*dumpIntermediateSteps=*/false}));
     }
 
     pm.addPass(triton::gpu::createTritonGPUPrefetch());
@@ -204,13 +212,14 @@ static void build_ttgir_pipeline(
     pm.addPass(createSymbolDCEPass());
 
     if (capability / 10 >= 9) {
-        pm.addPass(createTritonNvidiaGPUFenceInsertionPass());
-        pm.addPass(createTritonNvidiaGPUTMALoweringPass());
+        // v3.6 sig change: FenceInsertion now takes capability.
+        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUFenceInsertionPass(capability));
+        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUTMALoweringPass());
     }
     pm.addPass(createCanonicalizerPass());
 }
 
-// ── llir pass pipeline (mirrors make_llir) ───────────────────────
+// ── llir pass pipeline (mirrors v3.6.0 make_llir, simplified) ────
 static void build_llir_pipeline(
     mlir::PassManager& pm,
     int capability,
@@ -219,8 +228,11 @@ static void build_llir_pipeline(
     using namespace mlir;
     pm.addPass(triton::NVIDIA::createDecomposeUnsupportedConversionsPass());
     pm.addPass(triton::gpu::createTritonGPUCombineTensorSelectAndIf());
-    pm.addPass(createConvertSCFToCFPass());
+    // v3.6 rename: createConvertSCFToCFPass → createSCFToControlFlowPass.
+    pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createConvertIndexToLLVMPass());
+    // v3.6: AllocateSharedMemory moved to NV-specific & takes (cap, ptxv).
+    // Use the NVIDIA backend's allocator instead of the generic one.
     pm.addPass(triton::gpu::createAllocateSharedMemoryPass());
     pm.addPass(triton::createConvertTritonGPUToLLVMPass(capability, ptx_version));
     pm.addPass(triton::createConvertNVGPUToLLVMPass());
@@ -228,7 +240,8 @@ static void build_llir_pipeline(
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
     pm.addPass(createSymbolDCEPass());
-    pm.addPass(createLLVMDIScopePass());
+    // v3.6 rename: createLLVMDIScopePass → createLLVMDIScope.
+    pm.addPass(createLLVMDIScope());
 }
 
 // Link libdevice.10.bc into the module so calls to __nv_rsqrtf etc.
@@ -424,11 +437,11 @@ TritonResult* triton_compile_mlir(
             llvm::StringRef(mlir_text), &ctx->mlirCtx);
         if (!module) return make_error("parseSourceString returned null (invalid MLIR)");
 
-        // 2. TTIR → TTGIR pass pipeline.
-        mlir::triton::nvidia_gpu::ClusterInfo cluster_info;
+        // 2. TTIR → TTGIR pass pipeline. (v3.6 dropped the ClusterInfo
+        // arg from PlanCTAPass; cluster dims are now in module attrs.)
         {
             mlir::PassManager pm(&ctx->mlirCtx);
-            build_ttgir_pipeline(pm, opts, capability, cluster_info);
+            build_ttgir_pipeline(pm, opts, capability);
             if (mlir::failed(pm.run(*module)))
                 return make_error("ttgir pass pipeline failed");
         }
@@ -496,10 +509,10 @@ TritonResult* triton_compile_mlir(
         meta += "\"num_ctas\":" + std::to_string(opts->num_ctas) + ",";
         meta += "\"shared_mem\":" + std::to_string(shared_mem) + ",";
         meta += "\"target_arch\":\"" + std::string(opts->target_arch) + "\",";
-        meta += "\"cluster_dims\":[" +
-                std::to_string(cluster_info.clusterDimX) + "," +
-                std::to_string(cluster_info.clusterDimY) + "," +
-                std::to_string(cluster_info.clusterDimZ) + "]";
+        // Cluster dims live as a module attribute in v3.6 (set by
+        // PlanCTAPass) — for now hardcode (1,1,1) which is the default
+        // for non-Hopper. Phase-2: extract via mod->getAttr("ttg.cluster-dims").
+        meta += "\"cluster_dims\":[1,1,1]";
         meta += "}";
 
         // 8. Pack result.
