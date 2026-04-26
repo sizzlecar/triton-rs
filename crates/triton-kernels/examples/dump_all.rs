@@ -59,6 +59,9 @@ fn main() {
         "flash_decode_attn_phase2_f32"      => flash_decode_attn_phase2_f32::<128, 32>::mlir(),
         "batched_flash_decode_attn_phase1_f32"
                                             => batched_flash_decode_attn_phase1_f32::<128, 32>::mlir(),
+        // flash_attn_full is dtype-generic; we dump both instantiations.
+        "flash_attn_full_f32"               => flash_attn_full::<f32, 128, 1, 32>::mlir(),
+        "flash_attn_full_f16"               => flash_attn_full::<f16, 128, 1, 32>::mlir(),
     ];
 
     match target {

@@ -99,6 +99,31 @@ fn flash_decode_phase2_combines_via_log_sum_exp() {
 }
 
 #[test]
+fn flash_attn_full_f32_emits_causal_mask_arithmetic() {
+    let text = flash_attn_full::<f32, 128, 1, 32>::mlir();
+    assert!(text.contains("tt.func @flash_attn_full("));
+    // 3D grid: program_id(0)=q_tile, (1)=head, (2)=batch.
+    assert!(text.matches("\"tt.get_program_id\"").count() >= 3);
+    // Online softmax loop with 3 iter_args.
+    assert!(text.contains("\"scf.for\""));
+    assert!(text.contains("\"math.exp\""));
+    // Causal mask uses cmpi (k_pos <= q_pos) → i1 → sitofp → arith on f32.
+    assert!(text.contains("\"arith.cmpi\""));
+    assert!(text.contains("\"arith.sitofp\""));
+    // Final per-row normalisation + 2D store.
+    assert!(text.contains("\"tt.store\""));
+}
+
+#[test]
+fn flash_attn_full_f16_dtype_generic_distinct_from_f32() {
+    let f32_text = flash_attn_full::<f32, 128, 1, 32>::mlir();
+    let f16_text = flash_attn_full::<f16, 128, 1, 32>::mlir();
+    assert_ne!(f32_text, f16_text, "dtype-generic should produce different IR");
+    assert!(f16_text.contains("tensor<32x128xf16>") || f16_text.contains("xf16>"),
+            "f16 instantiation must contain f16 tensors:\n{f16_text}");
+}
+
+#[test]
 fn paged_decode_attention_emits_block_table_gather() {
     let text = paged_decode_attention_f32::<128, 32>::mlir();
     assert!(text.contains("tt.func @paged_decode_attention_f32("));

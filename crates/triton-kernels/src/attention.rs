@@ -7,6 +7,8 @@
 //! query token).
 
 use triton_dsl::triton_kernel;
+#[allow(unused_imports)]
+pub use triton_ir::ty::{f16, TritonElem};
 
 #[allow(dead_code)]
 struct Ptr<T>(::std::marker::PhantomData<T>);
@@ -674,4 +676,145 @@ pub fn batched_flash_decode_attn_phase1_f32<const HEAD_DIM: usize, const BLOCK_K
     store(partial_acc + partial_acc_off, acc_final, dim_mask);
     store(partial_max + out_idx, m_final);
     store(partial_sum + out_idx, l_final);
+}
+
+/// **Full flash attention — prefill / autoregressive with causal mask**.
+///
+/// Multi-token Q version of decode_attention. Used for prefill
+/// (initial sequence pass) and full-sequence autoregressive. Each block
+/// handles a `BLOCK_Q`-wide tile of query positions; within the block,
+/// the canonical online-softmax loop sweeps the KV stream in
+/// `BLOCK_KV` tiles.
+///
+/// Causal mask: position `i` can only attend to positions `≤ pos_offset + i`.
+/// Implemented via score-arithmetic (no `arith.select` in DSL yet):
+///   `scores += (mask_f32 - 1) * 1e30` where `mask_f32` is 1 for allowed,
+///   0 for blocked. Blocked positions get -1e30, which softmax flushes
+///   to ~0. (Once DSL has `arith.select`, swap to a cleaner `where`.)
+///
+/// Shapes (one block per (batch, head, q_tile)):
+/// - `Q`: `[batch, num_heads, q_len, head_dim]`
+/// - `K, V`: `[batch, num_kv_heads, kv_len, head_dim]`
+/// - `O`: `[batch, num_heads, q_len, head_dim]`
+///
+/// Launch: grid = (ceil(q_len / BLOCK_Q), num_heads, batch).
+/// v0 assumes `q_len % BLOCK_Q == 0`, `kv_len % BLOCK_KV == 0`,
+/// `head_dim == HEAD_DIM`.
+#[triton_kernel]
+pub fn flash_attn_full<
+    T: TritonElem,
+    const HEAD_DIM: usize,
+    const BLOCK_Q: usize,
+    const BLOCK_KV: usize,
+>(
+    q: Ptr<T>,
+    k: Ptr<T>,
+    v: Ptr<T>,
+    output: Ptr<T>,
+    num_heads: i32,
+    num_kv_heads: i32,
+    q_len: i32,
+    kv_len: i32,
+    head_dim: i32,
+    pos_offset: i32,
+    scale: f32,
+) {
+    let _ = num_heads;
+    let q_tile_id = program_id(0);
+    let head = program_id(1);
+    let batch = program_id(2);
+
+    let num_kv_groups = num_heads / num_kv_heads;
+    let kv_head = head / num_kv_groups;
+
+    let dim_range = make_range(0, HEAD_DIM as i32);
+    let dim_mask = dim_range < head_dim;
+    let q_pos_range = make_range(0, BLOCK_Q as i32) + q_tile_id * (BLOCK_Q as i32);
+
+    // Per-batch, per-head Q row base: b*(num_heads*q_len*head_dim) + h*(q_len*head_dim)
+    let q_batch_base = batch * num_heads * q_len * head_dim + head * q_len * head_dim;
+    // Q tile [BLOCK_Q, HEAD_DIM]
+    let q_row_base = q_pos_range * head_dim + q_batch_base;
+    let q_row_2d = expand_dims(q_row_base, 1);
+    let dim_2d = expand_dims(dim_range, 0);
+    let q_off_2d = q_row_2d + dim_2d;
+    let q_tile = load(q + q_off_2d);
+
+    // KV tile pointer base (per-batch, per-kv-head).
+    let kv_batch_base = batch * num_kv_heads * kv_len * head_dim
+        + kv_head * kv_len * head_dim;
+    let kv_blocks = kv_len / (BLOCK_KV as i32);
+
+    // Online softmax state: m_i [BLOCK_Q], l_i [BLOCK_Q], acc [BLOCK_Q, HEAD_DIM]
+    // Build init tensors of the right shape by re-loading Q col 0
+    // (cheap; the proc-macro doesn't yet have a "zeros tensor" builder).
+    let q_col0 = load(q + q_pos_range * head_dim + q_batch_base); // [BLOCK_Q]
+    let m_i_init = q_col0 * 0.0_f32 - 1.0e30_f32;
+    let l_i_init = q_col0 * 0.0_f32;
+    let acc_init = q_tile * 0.0_f32; // [BLOCK_Q, HEAD_DIM]
+
+    let (_, l_i, acc) = scf_for(
+        const_i32(0),
+        kv_blocks,
+        const_i32(1),
+        (m_i_init, l_i_init, acc_init),
+        |kb, (m_i, l_i, acc)| {
+            let kv_pos_base = kb * (BLOCK_KV as i32);
+            let kv_pos_range = make_range(0, BLOCK_KV as i32) + kv_pos_base;
+
+            // K tile [BLOCK_KV, HEAD_DIM]
+            let k_row_base = kv_pos_range * head_dim + kv_batch_base;
+            let k_row_2d = expand_dims(k_row_base, 1);
+            let k_off_2d = k_row_2d + dim_2d;
+            let k_tile = load(k + k_off_2d);
+            let v_tile = load(v + k_off_2d);
+
+            // scores[BLOCK_Q, BLOCK_KV] = Q_tile[BLOCK_Q, HD] · K_tile[BLOCK_KV, HD]^T
+            // Computed as broadcast-mul-reduce on a 3D intermediate:
+            //   q_3d: [BLOCK_Q, 1, HD] ; k_3d: [1, BLOCK_KV, HD]
+            //   qk_3d = q_3d * k_3d → [BLOCK_Q, BLOCK_KV, HD]
+            //   scores = reduce(qk_3d, dim=2)  → [BLOCK_Q, BLOCK_KV]
+            // Real production may swap to tt.dot for HEAD_DIM ≥ 64.
+            let q_3d = expand_dims(q_tile, 1); // [BLOCK_Q, 1, HEAD_DIM]
+            let k_3d = expand_dims(k_tile, 0); // [1, BLOCK_KV, HEAD_DIM]
+            let qk = q_3d * k_3d; // [BLOCK_Q, BLOCK_KV, HEAD_DIM]
+            let scores_raw = reduce(qk, 2, |a, b| a + b); // [BLOCK_Q, BLOCK_KV]
+            let scores_scaled = scores_raw * scale;
+
+            // ── causal mask ──
+            // For each (q, k) in tile: allow if (kv_pos_base + k) <= (pos_offset + q_pos_range[q])
+            let q_pos_2d = expand_dims(q_pos_range + pos_offset, 1); // [BLOCK_Q, 1]
+            let k_pos_2d = expand_dims(kv_pos_range, 0);              // [1, BLOCK_KV]
+            let causal_mask = k_pos_2d <= q_pos_2d;                   // [BLOCK_Q, BLOCK_KV] i1
+            let mask_f = to_f32(causal_mask);
+            let masked_scores = scores_scaled + (mask_f - 1.0_f32) * 1.0e30_f32;
+
+            // ── online softmax (per-row) ──
+            let row_max = reduce(masked_scores, 1, |a, b| max(a, b)); // [BLOCK_Q]
+            let m_ij = max(m_i, row_max);
+            let alpha = exp(m_i - m_ij);
+            let p = exp(masked_scores - expand_dims(m_ij, 1)); // [BLOCK_Q, BLOCK_KV]
+            let l_ij = reduce(p, 1, |a, b| a + b);              // [BLOCK_Q]
+
+            // ── pv accumulation: acc[q, d] += p[q, k] * V[k, d] summed over k ──
+            // p_3d: [BLOCK_Q, BLOCK_KV, 1] ; v_3d: [1, BLOCK_KV, HEAD_DIM]
+            let p_3d = expand_dims(p, 2);
+            let v_3d = expand_dims(v_tile, 0);
+            let pv = p_3d * v_3d;                                // [BLOCK_Q, BLOCK_KV, HEAD_DIM]
+            let pv_sum = reduce(pv, 1, |a, b| a + b);           // [BLOCK_Q, HEAD_DIM]
+
+            let alpha_2d = expand_dims(alpha, 1);
+            let new_acc = acc * alpha_2d + pv_sum;
+            let new_l_i = l_i * alpha + l_ij;
+            (m_ij, new_l_i, new_acc)
+        },
+    );
+
+    // ── normalize + write ──
+    let l_i_2d = expand_dims(l_i, 1);
+    let out_v = acc / l_i_2d;
+    let out_row_base = q_pos_range * head_dim + q_batch_base;
+    let out_row_2d = expand_dims(out_row_base, 1);
+    let out_off_2d = out_row_2d + dim_2d;
+    store(output + out_off_2d, out_v, dim_mask);
 }
