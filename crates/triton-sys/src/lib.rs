@@ -39,7 +39,7 @@ pub enum TritonError {
 ///
 /// Pinned in `crates/triton-sys/tools/fetch_vendor.sh`. Bumped to `v3.6.0`
 /// in Phase 1F per ARCHITECTURE.md §2.2.
-pub const TARGETED_TRITON_VERSION: &str = "v3.2.0";
+pub const TARGETED_TRITON_VERSION: &str = "v3.6.0";
 
 /// Compile options forwarded to Triton's pass pipeline. Mirrors the
 /// `TritonCompileOptions` C struct in `shim/triton_c.h`.
