@@ -97,16 +97,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.load_ptx(ptx, module_name, &[kernel_name])?;
         let func = dev.get_func(module_name, kernel_name).ok_or("kernel not found")?;
 
-        // Warmup.
+        // cudarc's `launch` takes `self` by value; clone the lightweight
+        // CudaFunction handle each iteration so we can call it in a loop.
         for _ in 0..WARMUP {
-            unsafe { func.launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?; }
+            unsafe { func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?; }
         }
         dev.synchronize()?;
 
-        // Time.
         let t0 = Instant::now();
         for _ in 0..ITERS {
-            unsafe { func.launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?; }
+            unsafe { func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?; }
         }
         dev.synchronize()?;
         let elapsed = t0.elapsed().as_secs_f64();
