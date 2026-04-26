@@ -83,6 +83,26 @@ pub fn mulf(lhs: Value, rhs: Value) -> OpSpec {
         .with_result(ty)
 }
 
+/// `arith.remsi` — signed integer remainder (`lhs % rhs`). Heavily used
+/// in attention/RoPE/KV-cache kernels where one program_id encodes a
+/// flattened (batch, head) tuple.
+pub fn remsi(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.remsi")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.remui` — unsigned integer remainder.
+pub fn remui(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.remui")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
 /// `arith.maximumf` — element-wise float max (NaN-propagating). Use this
 /// for softmax's row-max pass and similar reductions. The `_num` variant
 /// (`maxnumf`) treats NaN as a missing value and prefers non-NaN; we

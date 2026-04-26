@@ -93,6 +93,17 @@ pub fn div(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
     }
 }
 
+/// `a % b` — signed integer remainder. Floats and pointers panic.
+pub fn rem(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    if is_ptr_like(a.ty()) {
+        panic!("ops::rem on pointer types is not meaningful; got {}", a.ty());
+    }
+    if is_float(a.ty()) {
+        panic!("ops::rem on float types is not yet supported; got {}", a.ty());
+    }
+    f.op_one(arith::remsi(a, b))
+}
+
 /// `max(a, b)`. Dispatches between `arith.maximumf` (float) and
 /// `arith.maxsi` (signed integer).
 pub fn max(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {

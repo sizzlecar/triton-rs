@@ -407,6 +407,11 @@ impl<'m> FuncBuilder<'m> {
         let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::div(self, a, b)
     }
+    /// Type-dispatched `%`. See [`crate::ops::rem`].
+    pub fn rem(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
+        crate::ops::rem(self, a, b)
+    }
     /// Type-dispatched `max`. See [`crate::ops::max`].
     pub fn max(&mut self, a: Value, b: Value) -> Value {
         let (a, b) = self.coerce_elemwise(a, b);

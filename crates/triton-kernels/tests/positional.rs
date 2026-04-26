@@ -6,16 +6,12 @@ use triton_kernels::prelude::*;
 fn rope_q_emits_pair_rotation() {
     let text = rope_q_f32::<64>::mlir();
     assert!(text.contains("tt.func @rope_q_f32("));
-    // 2 input loads (cos, sin) + 2 data loads (x0, x1) = 4 loads
     assert_eq!(text.matches("\"tt.load\"").count(), 4,
                "rope_q should load cos, sin, x0, x1:\n{text}");
-    // 2 stores (lo half, hi half)
     assert_eq!(text.matches("\"tt.store\"").count(), 2);
-    // The rotation needs both addf and subf (out0 = x0*c - x1*s; out1 = x1*c + x0*s)
     assert!(text.contains("\"arith.addf\""));
     assert!(text.contains("\"arith.subf\""));
     assert!(text.contains("\"arith.mulf\""));
-    // Half-dim tile shape:
     assert!(text.contains("tensor<64xf32>"));
 }
 
@@ -26,4 +22,19 @@ fn rope_k_has_same_shape_as_rope_q() {
     assert_eq!(q, k,
                "rope_q and rope_k differ only in the function name and the \
                 tensor name `q`/`k` — same body shape");
+}
+
+#[test]
+fn rope_full_decodes_pid_then_loads_position() {
+    let text = rope_full_f32::<64>::mlir();
+    assert!(text.contains("tt.func @rope_full_f32("));
+    // Decode `(tok, h)` from a flat program_id via div + rem.
+    assert!(text.contains("\"arith.divsi\""), "missing divsi for tok decode:\n{text}");
+    assert!(text.contains("\"arith.remsi\""), "missing remsi for h decode:\n{text}");
+    // 5 loads: positions, cos, sin, x0, x1; 2 stores: out_lo, out_hi.
+    assert_eq!(text.matches("\"tt.load\"").count(), 5);
+    assert_eq!(text.matches("\"tt.store\"").count(), 2);
+    // Positions table is i32-typed.
+    let header = &text[..text.find(") {").unwrap()];
+    assert!(header.contains("!tt.ptr<i32>"), "missing i32 positions ptr:\n{header}");
 }

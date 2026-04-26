@@ -17,20 +17,24 @@ fn main() {
     }
 
     let kernels = all_kernels![
-        "vec_add_f32"                  => vec_add_f32::<1024>::mlir(),
-        "residual_add_f32"             => residual_add_f32::<1024>::mlir(),
-        "residual_add_inplace_f32"     => residual_add_inplace_f32::<1024>::mlir(),
-        "add_bias_f32"                 => add_bias_f32::<1024>::mlir(),
-        "gelu_f32"                     => gelu_f32::<1024>::mlir(),
-        "fused_silu_mul_f32"           => fused_silu_mul_f32::<1024>::mlir(),
-        "rms_norm_f32"                 => rms_norm_f32::<1024>::mlir(),
-        "layer_norm_f32"               => layer_norm_f32::<1024>::mlir(),
-        "fused_add_rms_norm_f32"       => fused_add_rms_norm_f32::<1024>::mlir(),
-        "softmax_f32"                  => softmax_f32::<1024>::mlir(),
-        "cross_entropy_forward_f32"    => cross_entropy_forward_f32::<1024>::mlir(),
-        "embedding_lookup_f32"         => embedding_lookup_f32::<1024>::mlir(),
-        "rope_q_f32"                   => rope_q_f32::<64>::mlir(),
-        "rope_k_f32"                   => rope_k_f32::<64>::mlir(),
+        "vec_add_f32"                       => vec_add_f32::<1024>::mlir(),
+        "residual_add_f32"                  => residual_add_f32::<1024>::mlir(),
+        "residual_add_inplace_f32"          => residual_add_inplace_f32::<1024>::mlir(),
+        "add_bias_f32"                      => add_bias_f32::<1024>::mlir(),
+        "gelu_f32"                          => gelu_f32::<1024>::mlir(),
+        "fused_silu_mul_f32"                => fused_silu_mul_f32::<1024>::mlir(),
+        "rms_norm_f32"                      => rms_norm_f32::<1024>::mlir(),
+        "layer_norm_f32"                    => layer_norm_f32::<1024>::mlir(),
+        "fused_add_rms_norm_f32"            => fused_add_rms_norm_f32::<1024>::mlir(),
+        "softmax_f32"                       => softmax_f32::<1024>::mlir(),
+        "cross_entropy_forward_f32"         => cross_entropy_forward_f32::<1024>::mlir(),
+        "embedding_lookup_f32"              => embedding_lookup_f32::<1024>::mlir(),
+        "rope_q_f32"                        => rope_q_f32::<64>::mlir(),
+        "rope_k_f32"                        => rope_k_f32::<64>::mlir(),
+        "rope_full_f32"                     => rope_full_f32::<64>::mlir(),
+        "kv_cache_append_f32"               => kv_cache_append_f32::<128>::mlir(),
+        "split_qkv_f32"                     => split_qkv_f32::<128>::mlir(),
+        "transpose_head_to_token_f32"       => transpose_head_to_token_f32::<128>::mlir(),
     ];
 
     match target {

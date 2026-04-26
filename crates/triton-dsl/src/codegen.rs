@@ -531,6 +531,7 @@ fn binop_method(op: &BinOp, span: &Span) -> Result<proc_macro2::Ident, syn::Erro
         BinOp::Sub(_) => "sub",
         BinOp::Mul(_) => "mul",
         BinOp::Div(_) => "div",
+        BinOp::Rem(_) => "rem",
         BinOp::Lt(_) => "lt",
         BinOp::Le(_) => "le",
         BinOp::Gt(_) => "gt",
@@ -542,7 +543,7 @@ fn binop_method(op: &BinOp, span: &Span) -> Result<proc_macro2::Ident, syn::Erro
                 *span,
                 format!(
                     "binary operator `{:?}` is not supported in #[triton_kernel] body \
-                     (supported: `+ - * / < <= > >= == !=`)",
+                     (supported: `+ - * / % < <= > >= == !=`)",
                     other
                 ),
             ));
