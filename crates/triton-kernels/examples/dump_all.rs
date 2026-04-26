@@ -40,6 +40,20 @@ fn main() {
         "decode_attention_hm_f32"           => decode_attention_hm_f32::<128, 32>::mlir(),
         "batched_decode_attention_f32"      => batched_decode_attention_f32::<128, 32>::mlir(),
         "paged_decode_attention_f32"        => paged_decode_attention_f32::<128, 32>::mlir(),
+        // f16 variants — ferrum's production path uses f16. Reduce ops
+        // upcast to f32 internally to match Python Triton's accuracy.
+        "vec_add_f16"                       => vec_add_f16::<1024>::mlir(),
+        "residual_add_f16"                  => residual_add_f16::<1024>::mlir(),
+        "residual_add_inplace_f16"          => residual_add_inplace_f16::<1024>::mlir(),
+        "add_bias_f16"                      => add_bias_f16::<1024>::mlir(),
+        "gelu_f16"                          => gelu_f16::<1024>::mlir(),
+        "fused_silu_mul_f16"                => fused_silu_mul_f16::<1024>::mlir(),
+        "fused_silu_mul_interleaved_f16"    => fused_silu_mul_interleaved_f16::<1024>::mlir(),
+        "rms_norm_f16"                      => rms_norm_f16::<1024>::mlir(),
+        "layer_norm_f16"                    => layer_norm_f16::<1024>::mlir(),
+        "fused_add_rms_norm_f16"            => fused_add_rms_norm_f16::<1024>::mlir(),
+        "softmax_f16"                       => softmax_f16::<1024>::mlir(),
+        "embedding_lookup_f16"              => embedding_lookup_f16::<1024>::mlir(),
     ];
 
     match target {

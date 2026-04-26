@@ -32,3 +32,24 @@ pub fn embedding_lookup_f32<const BLOCK: usize>(
     let v = load(embeddings + src_off, mask);
     store(output + dst_off, v, mask);
 }
+
+/// f16 embedding lookup. Pure-copy kernel — no compute, just gather +
+/// store. Same shape as the f32 variant.
+#[triton_kernel]
+pub fn embedding_lookup_f16<const BLOCK: usize>(
+    embeddings: Ptr<f16>,
+    indices: Ptr<i32>,
+    output: Ptr<f16>,
+    hidden_size: i32,
+) {
+    let tok = program_id(0);
+    let idx = load(indices + tok);
+
+    let cols = make_range(0, BLOCK as i32);
+    let mask = cols < hidden_size;
+
+    let src_off = idx * hidden_size + cols;
+    let dst_off = tok * hidden_size + cols;
+    let v = load(embeddings + src_off, mask);
+    store(output + dst_off, v, mask);
+}

@@ -45,17 +45,26 @@ pub mod reduction;
 pub mod prelude {
     pub use crate::cache::kv_cache_append_f32;
     pub use crate::elementwise::{
-        add_bias_f32, fused_silu_mul_f32, fused_silu_mul_interleaved_f32, gelu_f32,
-        residual_add_f32, residual_add_inplace_f32, vec_add_f32,
+        add_bias_f16, add_bias_f32,
+        fused_silu_mul_f16, fused_silu_mul_f32,
+        fused_silu_mul_interleaved_f16, fused_silu_mul_interleaved_f32,
+        gelu_f16, gelu_f32,
+        residual_add_f16, residual_add_f32,
+        residual_add_inplace_f16, residual_add_inplace_f32,
+        vec_add_f16, vec_add_f32,
     };
-    pub use crate::embedding::embedding_lookup_f32;
-    pub use crate::norms::{fused_add_rms_norm_f32, layer_norm_f32, rms_norm_f32};
+    pub use crate::embedding::{embedding_lookup_f16, embedding_lookup_f32};
+    pub use crate::norms::{
+        fused_add_rms_norm_f16, fused_add_rms_norm_f32,
+        layer_norm_f16, layer_norm_f32,
+        rms_norm_f16, rms_norm_f32,
+    };
     pub use crate::positional::{rope_full_f32, rope_k_f32, rope_q_f32};
     pub use crate::projection::{
         qk_norm_rope_transpose_f32, rope_transpose_f32, split_qkv_f32,
         transpose_head_to_token_f32, transpose_token_to_head_f32,
     };
-    pub use crate::reduction::{cross_entropy_forward_f32, softmax_f32};
+    pub use crate::reduction::{cross_entropy_forward_f32, softmax_f16, softmax_f32};
     pub use crate::attention::{
         batched_decode_attention_f32, decode_attention_f32, decode_attention_hm_f32,
         paged_decode_attention_f32,

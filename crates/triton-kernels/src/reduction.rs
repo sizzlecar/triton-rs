@@ -33,6 +33,34 @@ pub fn softmax_f32<const BLOCK: usize>(
     store(output + abs_off, result, mask);
 }
 
+/// f16 softmax. Compute happens in f32 (exp / sum / div); only loads
+/// and final store are f16. Matches Python Triton's standard pattern
+/// for stable f16 softmax.
+#[triton_kernel]
+pub fn softmax_f16<const BLOCK: usize>(
+    input: Ptr<f16>,
+    output: Ptr<f16>,
+    rows: i32,
+    cols: i32,
+) {
+    let _ = rows;
+    let row = program_id(0);
+    let row_off = row * cols;
+    let col_idx = make_range(0, BLOCK as i32);
+    let mask = col_idx < cols;
+    let abs_off = row_off + col_idx;
+
+    let xv = to_f32(load(input + abs_off, mask));
+
+    let row_max = reduce(xv, 0, |a, b| max(a, b));
+    let shifted = xv - row_max;
+    let exp_v = exp(shifted);
+    let sum_e = reduce(exp_v, 0, |a, b| a + b);
+    let result = exp_v / sum_e;
+
+    store(output + abs_off, to_f16(result), mask);
+}
+
 /// Cross-entropy forward (training utility, but useful as a shipped
 /// ready-to-use kernel when ferrum is extended for fine-tuning):
 /// `loss[r] = log(sum(exp(logits[r, :] - max))) + max - logits[r, label[r]]`.
