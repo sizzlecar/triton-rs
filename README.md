@@ -19,8 +19,30 @@ shortcomings of `@triton.jit`.
 |---|---|
 | `triton-ir` — pure-Rust MLIR text builder, `arith` / `tt` / `scf` dialect ops | ✅ working, validated against Triton 3.2.0 |
 | `triton-dsl` — `#[triton_kernel]` proc-macro, body translation, operator overloading, control flow, const generics | ✅ working |
-| `triton-runtime` — `DeviceRuntime` trait + cudarc backend | scaffold only (Phase 1 in progress) |
-| `triton-sys` — C ABI shim over vendored Triton C++ libs (zero-Python build path) | scaffold only (Phase 1) |
+| `triton-runtime` — `DeviceRuntime` trait + cudarc backend | ✅ working (cudarc launchers under `examples/run_*.rs`) |
+| `triton-sys` — C ABI shim over vendored Triton C++ libs (zero-Python build path) | **✅ Phase 1 done** — `Context::compile()` drives Triton's MLIR pass pipeline directly from C++; cubin loads via cudarc; **no Python in build or runtime path**. See `crates/triton-sys/SPIKE.md` for the orchestrator map and `BENCH_RESULTS.md` for parity numbers vs Python @triton.jit. |
+| `triton-kernels` — ready-to-use kernel library (rms_norm, residual_add, fused_silu_mul, gelu, softmax, layer_norm, embedding, RoPE, kv_cache_append, decode_attention, …) | ✅ 22 kernels in 8 modules; `use triton_kernels::prelude::*;` |
+| `triton-core` — user-facing facade re-exporting `triton_kernel`, `sys`, `runtime`, `ir` | ✅ working; `examples/ferrum_integration_demo.rs` is the worked end-to-end example |
+
+### One-shot integration (downstream like ferrum-infer-rs)
+
+```toml
+[dependencies]
+triton-core = { git = "https://github.com/sizzlecar/triton-rs", features = ["cuda", "compile-triton"] }
+```
+
+```rust
+use triton_core::{triton_kernel, sys::{Context, CompileOptions}};
+
+#[triton_kernel]
+fn vec_add<const BLOCK: usize>(x: Ptr<f32>, y: Ptr<f32>, out: Ptr<f32>, n: i32) { /* ... */ }
+
+let mlir = vec_add::<1024>::mlir();
+let cubin = Context::new()?.compile(&mlir, &CompileOptions::default())?;
+// load via cudarc, launch on GPU.
+```
+
+Build `compile-triton` only on Linux + CUDA boxes; the rest of the workspace `cargo check`s on Mac without it. See `crates/triton-core/examples/ferrum_integration_demo.rs` for the full demo.
 
 ## What works today
 

@@ -29,6 +29,7 @@
 // generated struct. Each *kernel function* is documented; that's what
 // users actually read.
 
+pub mod attention;
 pub mod cache;
 pub mod elementwise;
 pub mod embedding;
@@ -55,4 +56,5 @@ pub mod prelude {
         transpose_head_to_token_f32, transpose_token_to_head_f32,
     };
     pub use crate::reduction::{cross_entropy_forward_f32, softmax_f32};
+    pub use crate::attention::decode_attention_f32;
 }

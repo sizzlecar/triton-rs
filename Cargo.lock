@@ -363,9 +363,11 @@ dependencies = [
 name = "triton-core"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "triton-dsl",
  "triton-ir",
  "triton-runtime",
+ "triton-sys",
 ]
 
 [[package]]

@@ -17,8 +17,8 @@
 
 set -euo pipefail
 
-TRITON_TAG="${TRITON_TAG:-v3.2.0}"
-TRITON_COMMIT="${TRITON_COMMIT:-9641643}"        # truncated SHA — informational
+TRITON_TAG="${TRITON_TAG:-v3.2.0}"          # bump candidate: v3.6.0 (ARCHITECTURE.md target)
+TRITON_COMMIT="${TRITON_COMMIT:-9641643}"   # truncated SHA — informational
 TRITON_REPO="${TRITON_REPO:-https://github.com/triton-lang/triton}"
 
 # Resolve the vendor dir relative to this script's location so the script

@@ -10,7 +10,7 @@ description = "User-facing facade: re-exports the common triton-rs API"
 [features]
 default = ["cpu-emulation"]
 cpu-emulation = ["triton-runtime/cpu-emulation"]
-cuda = ["triton-runtime/cuda"]
+cuda = ["triton-runtime/cuda", "dep:cudarc"]
 # Forwards triton-sys's compile-triton (Linux + CUDA only). Enables
 # the in-process MLIR -> cubin path; without it `Kernel::compile()`
 # returns NotCompiled.
@@ -21,7 +21,11 @@ triton-ir.workspace = true
 triton-runtime.workspace = true
 triton-sys.workspace = true
 triton-dsl.workspace = true
+# cudarc as an *optional* dep so the integration_demo example can pull
+# it in via `--features cuda`. Stays out of the build (and its
+# build.rs CUDA discovery) when cuda is off — matters for Mac CI.
+cudarc = { workspace = true, optional = true }
 
-# Examples — not part of the public dep tree of consumers.
-[dev-dependencies]
-cudarc = { workspace = true }
+[[example]]
+name = "ferrum_integration_demo"
+required-features = ["cuda", "compile-triton"]

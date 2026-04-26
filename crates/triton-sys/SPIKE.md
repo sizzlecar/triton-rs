@@ -284,9 +284,36 @@ build tree).
 - [x] Every step has a public C++ entry point. (Verified by reading
       compiler.py + cross-referencing pybind wrapper file paths.)
 - [x] Pass lists are stable enough to copy verbatim per Triton version.
-- [ ] Linking Triton's `.a` files into a `cc::Build`-driven shim is
-      feasible (deferred to Phase 1B; this is the next risk gate).
+- [x] Linking Triton's `.a` files into a `cc::Build`-driven shim is
+      feasible. **Validated 2026-04-26 on Vast.ai** — `cargo build -p
+      triton-sys --features compile-triton` produces a 118 MB
+      `compile_mlir` example that compiles MLIR text to cubin and the
+      cubin runs on RTX 5070 Ti via cudarc with `max_err=0`.
 
-Phase 1B can begin. The submodule clone (still running on the proxy as
-of writing) only needs to finish before we can drive Triton's CMake; it
-isn't a blocker for this spike's conclusions.
+## v3.6.0 bump procedure (Phase 1F)
+
+The shim was originally pinned to v3.2.0 to match the test box. To bump:
+
+```sh
+# 1. wipe vendor cache + pre-built LLVM cache (different commit)
+rm -rf crates/triton-sys/vendor/triton ~/.cache/triton-rs/llvm
+
+# 2. fetch v3.6.0 source
+TRITON_TAG=v3.6.0 bash crates/triton-sys/tools/fetch_vendor.sh
+
+# 3. read the new LLVM commit
+cat crates/triton-sys/vendor/triton/cmake/llvm-hash.txt
+
+# 4. rebuild — build.rs auto-fetches the matching LLVM tarball
+cargo build -p triton-sys --features compile-triton
+
+# 5. probable break points (audit + patch shim/triton_c.cpp):
+#    - new pass added/removed in nvidia/backend/compiler.py make_ttgir
+#    - factory function signature change (e.g. ClusterInfo struct fields)
+#    - new mandatory header
+#    - LLVM API drift (rare within months)
+```
+
+Validate by running `bash tools/run_e2e.sh` + the three head-to-head
+benches; cubin should still pass `max_err=0` and bench numbers should
+stay within timer noise.
