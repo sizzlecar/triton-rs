@@ -49,3 +49,24 @@ fn decode_attention_emits_scf_for_with_three_iter_args() {
         "expected at least 3 loads (Q + K + V), got {n_loads}:\n{text}"
     );
 }
+
+#[test]
+fn decode_attention_hm_emits_kernel() {
+    let text = decode_attention_hm_f32::<128, 32>::mlir();
+    assert!(text.contains("tt.func @decode_attention_hm_f32("));
+    assert!(text.contains("\"scf.for\""));
+    assert!(text.contains("\"math.exp\""));
+    // Three loads minimum (Q + K + V); HM differs from canonical only in
+    // address arithmetic so the op count signal is the same.
+    assert!(text.matches("\"tt.load\"").count() >= 3);
+}
+
+#[test]
+fn batched_decode_attention_emits_kernel_with_div_rem_for_batch_decompose() {
+    let text = batched_decode_attention_f32::<128, 32>::mlir();
+    assert!(text.contains("tt.func @batched_decode_attention_f32("));
+    // Batch decompose = pid / num_q_heads + pid % num_q_heads.
+    assert!(text.contains("\"arith.divsi\""), "missing batch decompose:\n{text}");
+    assert!(text.contains("\"arith.remsi\""), "missing batch decompose:\n{text}");
+    assert!(text.contains("\"scf.for\""));
+}

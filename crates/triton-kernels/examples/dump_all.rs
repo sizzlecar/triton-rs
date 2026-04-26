@@ -37,6 +37,8 @@ fn main() {
         "transpose_head_to_token_f32"       => transpose_head_to_token_f32::<128>::mlir(),
         // HEAD_DIM=128 (typical Llama / Qwen size), BLOCK_KV=32 tile.
         "decode_attention_f32"              => decode_attention_f32::<128, 32>::mlir(),
+        "decode_attention_hm_f32"           => decode_attention_hm_f32::<128, 32>::mlir(),
+        "batched_decode_attention_f32"      => batched_decode_attention_f32::<128, 32>::mlir(),
     ];
 
     match target {
