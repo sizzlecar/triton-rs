@@ -35,6 +35,8 @@ fn main() {
         "kv_cache_append_f32"               => kv_cache_append_f32::<128>::mlir(),
         "split_qkv_f32"                     => split_qkv_f32::<128>::mlir(),
         "transpose_head_to_token_f32"       => transpose_head_to_token_f32::<128>::mlir(),
+        // HEAD_DIM=128 (typical Llama / Qwen size), BLOCK_KV=32 tile.
+        "decode_attention_f32"              => decode_attention_f32::<128, 32>::mlir(),
     ];
 
     match target {
