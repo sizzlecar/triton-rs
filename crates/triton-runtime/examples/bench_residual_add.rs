@@ -1,32 +1,16 @@
 //! Head-to-head benchmark: same `residual_add_f32(a, b, out, n)` kernel
-//! compiled through three different paths, timed under identical launch
-//! conditions on the same GPU. Reports per-kernel mean latency + effective
+//! compiled through three different paths, timed under per-kernel launch
+//! shape on the same GPU. Reports per-kernel mean latency + effective
 //! memory bandwidth.
 //!
-//! Build the three PTXes externally before running this binary:
-//!
-//! ```text
-//! # 1. triton-rs DSL  →  MLIR  →  Triton  →  PTX
-//! cargo run --example ferrum_residual_add -p triton-dsl --quiet -- f32 \\
-//!     > /tmp/bench/dsl/kernel.mlir
-//! python3 tools/mlir_to_cubin.py /tmp/bench/dsl/kernel.mlir /tmp/bench/dsl
-//!
-//! # 2. ferrum hand-written .cu  →  nvcc  →  PTX
-//! KERNEL_NAME=residual_add_f32 bash tools/compile_cu.sh \\
-//!     ../ferrum-infer-rs/crates/ferrum-kernels/kernels/residual_add.cu \\
-//!     /tmp/bench/cu
-//!
-//! # 3. Python @triton.jit  →  Triton  →  PTX (same backend as #1)
-//! python3 tools/compile_python_kernel.py \\
-//!     tools/python_kernels/residual_add.py residual_add_f32 \\
-//!     /tmp/bench/py \\
-//!     --signature 'a_ptr=*fp32,b_ptr=*fp32,out_ptr=*fp32,n=i32' \\
-//!     --constants 'BLOCK=1024'
-//!
-//! # 4. Run.
-//! cargo run --example bench_residual_add -p triton-runtime \\
-//!     --features cuda --release -- /tmp/bench
-//! ```
+//! Two correctness pieces that the first cut got wrong:
+//!   1. ferrum's hand-written .cu is **per-thread-per-element** (1 elt
+//!      per thread); the Triton path is **per-block-tile** (BLOCK elts
+//!      per block). We dispatch on `kernel.json.compiled_via` to pick the
+//!      right grid for each so all three actually write all N elements.
+//!   2. Buffers must exceed L2 cache (64 MB on RTX 5070 Ti) or we end up
+//!      benchmarking L2 hit bandwidth instead of DRAM. We use N = 32 M
+//!      f32 elements = 128 MB per buffer, 384 MB total — well above L2.
 
 #[cfg(not(feature = "cuda"))]
 fn main() {
@@ -44,18 +28,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: bench_residual_add BENCH_ROOT_DIR")?;
 
-    // Element count chosen large enough that launch overhead < kernel time.
-    // 16 MiB / kernel = a, b, out = 48 MiB total = well above L2 cache.
-    const N: usize = 4 * 1024 * 1024;
-    const BLOCK: u32 = 1024; // tile width; must match how each kernel was compiled
-    const NUM_WARPS: u32 = 4;
+    // 32 M f32 elements per buffer = 128 MB; 384 MB total touched per
+    // launch. RTX 5070 Ti L2 is 64 MB — this comfortably overflows it,
+    // so we measure DRAM bandwidth, not L2 hit.
+    const N: usize = 32 * 1024 * 1024;
+
+    // Triton tile shape (must match how the DSL/Python paths were compiled).
+    const TRITON_BLOCK: u32 = 1024;
+    const TRITON_NUM_WARPS: u32 = 4;
+    // Ferrum's .cu uses 1 element per thread; pick a common 256-thread
+    // block to match conventional CUDA launches.
+    const FERRUM_THREADS_PER_BLOCK: u32 = 256;
+
     const ITERS: usize = 200;
     const WARMUP: usize = 20;
 
     let dev = CudaDevice::new(0)?;
 
-    // Allocate ONE set of buffers and reuse — keep memory state identical
-    // across kernels.
     let host_a: Vec<f32> = (0..N).map(|i| (i as f32).sin()).collect();
     let host_b: Vec<f32> = (0..N).map(|i| (i as f32).cos()).collect();
     let dev_a = dev.htod_copy(host_a.clone())?;
@@ -63,25 +52,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
     let n_arg: i32 = N as i32;
 
-    let cfg = LaunchConfig {
-        grid_dim: (((N as u32) + BLOCK - 1) / BLOCK, 1, 1),
-        block_dim: (NUM_WARPS * 32, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let bytes_per_launch = (N * std::mem::size_of::<f32>() * 3) as f64;
 
-    let runs = [("triton-rs DSL", "dsl"), ("ferrum .cu (nvcc)", "cu"), ("Python @triton.jit", "py")];
+    // Approx effective DRAM peak for RTX 5070 Ti GDDR7 256-bit @ 28 Gbps.
+    const PEAK_GBPS: f64 = 896.0;
 
-    let bytes_per_launch = (N * std::mem::size_of::<f32>() * 3) as f64; // a + b + out
-
-    println!("residual_add_f32 head-to-head — N={N}, BLOCK={BLOCK}, num_warps={NUM_WARPS}");
-    println!("    bytes_per_launch = {:.2} MB", bytes_per_launch / 1e6);
+    println!("residual_add_f32 head-to-head");
+    println!("    N = {} elements ({} MB per buffer, {:.1} MB touched per call)",
+             N, N * 4 / 1_000_000, bytes_per_launch / 1e6);
     println!("    iters = {ITERS} (after {WARMUP} warmup)");
     println!();
-    println!("{:<22} {:>10} {:>14} {:>14} {:>10}",
-             "source", "us / call", "GB/s eff.", "GB/s peak%", "kernel");
+    println!("{:<22} {:>10} {:>11} {:>10} {:>10}",
+             "source", "us / call", "GB/s eff.", "% peak", "grid×block");
 
-    // RTX 5070 Ti theoretical peak: ~896 GB/s (rough estimate for 50-series)
-    const PEAK_GBPS: f64 = 896.0;
+    let runs = [("triton-rs DSL", "dsl"), ("ferrum .cu (nvcc)", "cu"), ("Python @triton.jit", "py")];
 
     for (label, sub) in &runs {
         let ptx_path = format!("{}/{}/kernel.ptx", bench_root, sub);
@@ -93,12 +77,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             meta["name"].as_str().ok_or("name missing")?.to_string().into_boxed_str(),
         );
         let module_name: &'static str = Box::leak(format!("bench_{}", sub).into_boxed_str());
+        let compiled_via = meta["compiled_via"]
+            .as_str()
+            .unwrap_or("triton_mlir")
+            .to_string();
+
+        // Pick the launch shape that actually covers all N elements for
+        // this kernel's compute model.
+        let cfg = match compiled_via.as_str() {
+            "nvcc" => LaunchConfig {
+                grid_dim: (((N as u32) + FERRUM_THREADS_PER_BLOCK - 1) / FERRUM_THREADS_PER_BLOCK, 1, 1),
+                block_dim: (FERRUM_THREADS_PER_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            _ => LaunchConfig {
+                grid_dim: (((N as u32) + TRITON_BLOCK - 1) / TRITON_BLOCK, 1, 1),
+                block_dim: (TRITON_NUM_WARPS * 32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        };
+        let grid_block_str = format!(
+            "{}×{}",
+            cfg.grid_dim.0,
+            cfg.block_dim.0
+        );
 
         dev.load_ptx(ptx, module_name, &[kernel_name])?;
         let func = dev.get_func(module_name, kernel_name).ok_or("kernel not found")?;
 
-        // cudarc's `launch` takes `self` by value; clone the lightweight
-        // CudaFunction handle each iteration so we can call it in a loop.
         for _ in 0..WARMUP {
             unsafe { func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?; }
         }
@@ -115,8 +121,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bw_gbps = bytes_per_launch / per_call / 1e9;
         let pct_peak = bw_gbps / PEAK_GBPS * 100.0;
 
-        println!("{:<22} {:>10.2} {:>14.1} {:>13.1}% {:>10}",
-                 label, per_call * 1e6, bw_gbps, pct_peak, kernel_name);
+        println!("{:<22} {:>10.1} {:>11.1} {:>9.1}% {:>10}",
+                 label, per_call * 1e6, bw_gbps, pct_peak, grid_block_str);
+    }
+
+    // Quick sanity check: spot-check the last result against the host
+    // reference so we don't accidentally bench a no-op kernel.
+    let host_out = dev.dtoh_sync_copy(&dev_out)?;
+    let want = host_a[42] + host_b[42];
+    let err = (host_out[42] - want).abs();
+    println!();
+    println!("sanity: out[42] = {} (host want {} err {})", host_out[42], want, err);
+    if err > 1e-5 {
+        eprintln!("WARN: last benchmarked kernel is NOT producing correct output!");
+        std::process::exit(2);
     }
 
     Ok(())
