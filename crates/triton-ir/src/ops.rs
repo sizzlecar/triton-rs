@@ -93,6 +93,31 @@ pub fn div(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
     }
 }
 
+/// `max(a, b)`. Dispatches between `arith.maximumf` (float) and
+/// `arith.maxsi` (signed integer).
+pub fn max(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    if is_ptr_like(a.ty()) {
+        panic!("ops::max on pointer types is not meaningful; got {}", a.ty());
+    }
+    if is_float(a.ty()) {
+        f.op_one(arith::maximumf(a, b))
+    } else {
+        f.op_one(arith::maxsi(a, b))
+    }
+}
+
+/// `min(a, b)`. Dispatches between `arith.minimumf` and `arith.minsi`.
+pub fn min(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    if is_ptr_like(a.ty()) {
+        panic!("ops::min on pointer types is not meaningful; got {}", a.ty());
+    }
+    if is_float(a.ty()) {
+        f.op_one(arith::minimumf(a, b))
+    } else {
+        f.op_one(arith::minsi(a, b))
+    }
+}
+
 // ── comparison (int + float) ────────────────────────────────────────────
 
 fn cmp(

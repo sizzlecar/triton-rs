@@ -83,6 +83,45 @@ pub fn mulf(lhs: Value, rhs: Value) -> OpSpec {
         .with_result(ty)
 }
 
+/// `arith.maximumf` — element-wise float max (NaN-propagating). Use this
+/// for softmax's row-max pass and similar reductions. The `_num` variant
+/// (`maxnumf`) treats NaN as a missing value and prefers non-NaN; we
+/// expose the propagating one here since most kernels assume finite inputs.
+pub fn maximumf(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.maximumf")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.minimumf` — element-wise float min (NaN-propagating).
+pub fn minimumf(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.minimumf")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.maxsi` — signed integer max.
+pub fn maxsi(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.maxsi")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.minsi` — signed integer min.
+pub fn minsi(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.minsi")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
 /// Integer comparison predicates accepted by `arith.cmpi`.
 #[derive(Debug, Clone, Copy)]
 pub enum CmpiPred {

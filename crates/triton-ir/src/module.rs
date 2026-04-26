@@ -368,6 +368,14 @@ impl<'m> FuncBuilder<'m> {
     pub fn div(&mut self, a: Value, b: Value) -> Value {
         crate::ops::div(self, a, b)
     }
+    /// Type-dispatched `max`. See [`crate::ops::max`].
+    pub fn max(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::max(self, a, b)
+    }
+    /// Type-dispatched `min`. See [`crate::ops::min`].
+    pub fn min(&mut self, a: Value, b: Value) -> Value {
+        crate::ops::min(self, a, b)
+    }
     /// Type-dispatched `<`. See [`crate::ops::lt`].
     pub fn lt(&mut self, a: Value, b: Value) -> Value {
         crate::ops::lt(self, a, b)

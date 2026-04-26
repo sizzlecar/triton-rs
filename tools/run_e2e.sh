@@ -59,6 +59,8 @@ case "${RUNNER:-auto}" in
             ferrum_residual_add_inplace) RUNNER=run_residual_add_inplace ;;
             ferrum_add_bias)             RUNNER=run_add_bias ;;
             ferrum_rms_norm)             RUNNER=run_rms_norm ;;
+            ferrum_softmax)              RUNNER=run_softmax ;;
+            ferrum_layer_norm)           RUNNER=run_layer_norm ;;
             *)                           RUNNER=run_vec_add ;;
         esac
         ;;

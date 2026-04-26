@@ -872,6 +872,21 @@ fn op_spec_for(
             CallKind::Value,
             quote! { ::triton_ir::dialect::tt::erf(#(#args),*) },
         ),
+
+        // Type-dispatched max / min — methods on FuncBuilder so they work in
+        // both top-level and closure-body context (same auto-reborrow trick
+        // as the binary operators).
+        "max" if n == 2 => {
+            let a = &args[0];
+            let b = &args[1];
+            (CallKind::Value, quote! { __triton_f.max(#a, #b) })
+        }
+        "min" if n == 2 => {
+            let a = &args[0];
+            let b = &args[1];
+            (CallKind::Value, quote! { __triton_f.min(#a, #b) })
+        }
+        "max" | "min" => return Err(arity_err("2")),
         "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "sin" | "cos" | "abs"
         | "tanh" | "erf" => {
             return Err(arity_err("1"));
