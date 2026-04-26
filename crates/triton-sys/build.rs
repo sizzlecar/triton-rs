@@ -173,31 +173,33 @@ mod compile_triton {
             "TritonNVIDIAGPUToLLVM",
         ];
 
-        let mut cfg = cmake::Config::new(vendor_dir);
-        cfg.define("TRITON_BUILD_TUTORIALS", "OFF")
-            .define("TRITON_BUILD_PYTHON_MODULE", "OFF")
-            .define("TRITON_BUILD_PROTON", "OFF")
-            .define("TRITON_BUILD_UT", "OFF")
-            .define("TRITON_CODEGEN_BACKENDS", "nvidia")
-            .define("CMAKE_BUILD_TYPE", "Release")
-            .define("LLVM_LIBRARY_DIR", llvm_root.join("lib"))
-            .define("LLVM_INCLUDE_DIRS", llvm_root.join("include"))
-            .define("MLIR_DIR", llvm_root.join("lib/cmake/mlir"))
-            .out_dir(out_dir.join("triton-build"));
+        // cmake-rs's `build_target` accepts one target per `build()` call,
+        // and its default of "install" tries to build everything (including
+        // bin/ tools that fail due to AMD-backend headers being absent in
+        // NVIDIA-only configs). Loop over the libs, building each in turn —
+        // the configure step is cached, so only the per-target compile cost
+        // is paid once. cmake parallelism inside each call still uses all
+        // cores via CMAKE_BUILD_PARALLEL_LEVEL.
+        let mk_cfg = || {
+            let mut cfg = cmake::Config::new(vendor_dir);
+            cfg.define("TRITON_BUILD_TUTORIALS", "OFF")
+                .define("TRITON_BUILD_PYTHON_MODULE", "OFF")
+                .define("TRITON_BUILD_PROTON", "OFF")
+                .define("TRITON_BUILD_UT", "OFF")
+                .define("TRITON_CODEGEN_BACKENDS", "nvidia")
+                .define("CMAKE_BUILD_TYPE", "Release")
+                .define("LLVM_LIBRARY_DIR", llvm_root.join("lib"))
+                .define("LLVM_INCLUDE_DIRS", llvm_root.join("include"))
+                .define("MLIR_DIR", llvm_root.join("lib/cmake/mlir"))
+                .out_dir(out_dir.join("triton-build"));
+            cfg
+        };
 
-        // cmake-rs runs `cmake --build PATH --config Release -- BUILD_ARGS`,
-        // so `build_arg` lands at the underlying build tool (make on Linux,
-        // not cmake itself). Pass target names directly as positional make
-        // args (`make TARGET1 TARGET2 ...`) instead of `--target` which is
-        // a cmake flag, not a make flag.
+        let mut dst = PathBuf::new();
         for t in LIB_TARGETS {
-            cfg.build_arg(*t);
+            eprintln!("triton-sys: building cmake target `{}`", t);
+            dst = mk_cfg().build_target(t).build();
         }
-        // -k = keep-going: don't bail on first failed target so we get
-        //      maximum coverage when bumping Triton versions.
-        cfg.build_arg("-k");
-
-        let dst = cfg.build();
         eprintln!("triton-sys: cmake build root = {}", dst.display());
         dst
     }
