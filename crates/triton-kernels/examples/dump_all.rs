@@ -57,6 +57,8 @@ fn main() {
         // Flash decode (split-K) — 2 coordinated kernels.
         "flash_decode_attn_phase1_f32"      => flash_decode_attn_phase1_f32::<128, 32>::mlir(),
         "flash_decode_attn_phase2_f32"      => flash_decode_attn_phase2_f32::<128, 32>::mlir(),
+        "batched_flash_decode_attn_phase1_f32"
+                                            => batched_flash_decode_attn_phase1_f32::<128, 32>::mlir(),
     ];
 
     match target {

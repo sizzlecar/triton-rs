@@ -570,3 +570,108 @@ pub fn flash_decode_attn_phase2_f32<
     let out_off = q_head * head_dim + dim_range;
     store(output + out_off, out_v, dim_mask);
 }
+
+/// **Batched flash decode attention — Phase 1 (batched split-K)**.
+///
+/// Combines [`batched_decode_attention_f32`]'s outer batch dimension
+/// with [`flash_decode_attn_phase1_f32`]'s split-K. Used by ferrum's
+/// long-context continuous-batch decode: many sequences in flight,
+/// each with KV cache long enough to benefit from split-K.
+///
+/// Shapes:
+/// - `q`               : `[batch, num_q_heads, head_dim]`
+/// - `k_cache, v_cache`: `[batch, seq_len, num_kv_heads, head_dim]`
+/// - `partial_acc`     : `[batch, num_q_heads, num_splits, head_dim]` f32
+/// - `partial_max`     : `[batch, num_q_heads, num_splits]`           f32
+/// - `partial_sum`     : `[batch, num_q_heads, num_splits]`           f32
+///
+/// Launch: grid = (batch * num_q_heads, num_splits, 1).
+/// Phase 2 reuses [`flash_decode_attn_phase2_f32`] applied per
+/// (batch, q_head); caller flattens the batch dim into num_q_heads
+/// when invoking phase 2.
+#[triton_kernel]
+pub fn batched_flash_decode_attn_phase1_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
+    q: Ptr<f32>,
+    k_cache: Ptr<f32>,
+    v_cache: Ptr<f32>,
+    partial_acc: Ptr<f32>,
+    partial_max: Ptr<f32>,
+    partial_sum: Ptr<f32>,
+    batch_size: i32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    seq_len: i32,
+    valid_kv_len: i32,
+    num_splits: i32,
+    scale: f32,
+) {
+    let _ = batch_size;
+    let pid = program_id(0);
+    let split_id = program_id(1);
+    let b = pid / num_q_heads;
+    let q_head = pid % num_q_heads;
+    let num_kv_groups = num_q_heads / num_kv_heads;
+    let kv_head = q_head / num_kv_groups;
+
+    let dim_range = make_range(0, HEAD_DIM as i32);
+    let dim_mask = dim_range < head_dim;
+    // Q row for this batch + head.
+    let q_row_base = b * num_q_heads * head_dim + q_head * head_dim;
+    let q_v = load(q + q_row_base + dim_range, dim_mask);
+
+    let m_init = const_f32(0.0_f32) - const_f32(1.0e30_f32);
+    let l_init = const_f32(0.0_f32);
+    let acc_init = q_v * 0.0_f32;
+
+    let kv_batch_base = b * seq_len * num_kv_heads * head_dim;
+    let kv_stride = num_kv_heads * head_dim;
+    let chunk_blocks = (valid_kv_len / num_splits) / (BLOCK_KV as i32);
+    let split_start_block = split_id * chunk_blocks;
+
+    let (m_final, l_final, acc_final) = scf_for(
+        const_i32(0),
+        chunk_blocks,
+        const_i32(1),
+        (m_init, l_init, acc_init),
+        |kb, (m_i, l_i, acc)| {
+            let pos_base = (split_start_block + kb) * (BLOCK_KV as i32);
+            let pos_range = make_range(0, BLOCK_KV as i32) + pos_base;
+
+            let row_base = pos_range * kv_stride + kv_head * head_dim + kv_batch_base;
+            let row_base_2d = expand_dims(row_base, 1);
+            let col_2d = expand_dims(dim_range, 0);
+            let kv_off_2d = row_base_2d + col_2d;
+
+            let k_block = load(k_cache + kv_off_2d);
+            let v_block = load(v_cache + kv_off_2d);
+
+            let q_2d = expand_dims(q_v, 0);
+            let qk = q_2d * k_block;
+            let scores_raw = reduce(qk, 1, |a, b| a + b);
+            let scores = scores_raw * scale;
+
+            let scores_max = reduce(scores, 0, |a, b| max(a, b));
+            let m_ij = max(m_i, scores_max);
+            let alpha = exp(m_i - m_ij);
+            let p = exp(scores - m_ij);
+            let l_ij = reduce(p, 0, |a, b| a + b);
+
+            let p_2d = expand_dims(p, 1);
+            let pv = p_2d * v_block;
+            let pv_sum = reduce(pv, 0, |a, b| a + b);
+
+            let new_acc = acc * alpha + pv_sum;
+            let new_l_i = l_i * alpha + l_ij;
+            (m_ij, new_l_i, new_acc)
+        },
+    );
+
+    // out_idx in flattened (batch, q_head, split) layout.
+    let bh = b * num_q_heads + q_head;
+    let out_idx = bh * num_splits + split_id;
+    let partial_acc_off = out_idx * head_dim + dim_range;
+    store(partial_acc + partial_acc_off, acc_final, dim_mask);
+    store(partial_max + out_idx, m_final);
+    store(partial_sum + out_idx, l_final);
+}
