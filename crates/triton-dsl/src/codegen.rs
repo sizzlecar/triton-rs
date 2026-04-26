@@ -41,26 +41,36 @@ pub fn expand(input: &ItemFn) -> Result<TokenStream2, syn::Error> {
     let (impl_gen, ty_gen, where_clause) = input.sig.generics.split_for_impl();
     let has_generics = !input.sig.generics.params.is_empty();
 
-    // For unit-struct-with-generics we need PhantomData to "use" any type/
-    // lifetime params. Const generics alone don't need it. Detect to keep
-    // the simple case clean.
-    let needs_phantom = input
-        .sig
-        .generics
-        .params
-        .iter()
-        .any(|p| !matches!(p, syn::GenericParam::Const(_)));
+    // Collect type-param idents for the PhantomData tuple. Const generics
+    // need no phantom (the value is already on the type). Lifetimes do.
+    // For type/lifetime params, build a tuple `(PhantomData<T1>, ...)`
+    // — the `fn() <ty_gen>` trick fails when const generics are mixed in
+    // (cannot apply <...> to a fn() type).
+    let mut phantom_fields: Vec<TokenStream2> = Vec::new();
+    for p in input.sig.generics.params.iter() {
+        match p {
+            syn::GenericParam::Type(t) => {
+                let ident = &t.ident;
+                phantom_fields.push(quote! { ::std::marker::PhantomData<#ident> });
+            }
+            syn::GenericParam::Lifetime(lt) => {
+                let lifetime = &lt.lifetime;
+                phantom_fields.push(quote! { ::std::marker::PhantomData<& #lifetime ()> });
+            }
+            syn::GenericParam::Const(_) => {}
+        }
+    }
 
     // Struct definitions need the *declaration*-style generics
     // (`<const BLOCK: usize>`), which ImplGenerics emits — TypeGenerics
     // would emit `<BLOCK>` alone, dropping the kind/bound and triggering
     // E0392 / E0747 at the use site.
     let struct_def = if has_generics {
-        if needs_phantom {
+        if !phantom_fields.is_empty() {
             quote! {
                 #[allow(non_camel_case_types)]
                 #vis struct #fn_name #impl_gen #where_clause (
-                    ::std::marker::PhantomData<fn() #ty_gen>,
+                    #(#phantom_fields),*,
                 );
             }
         } else {
@@ -187,11 +197,22 @@ fn rust_type_to_ir_type(ty: &Type) -> Result<TokenStream2, syn::Error> {
             let inner_expr = rust_type_to_ir_type(inner_ty)?;
             Ok(quote! { ::triton_ir::ty::Type::ptr(#inner_expr) })
         }
+        // Generic type parameter (e.g. `T` in `vec_add<T: TritonElem, ...>`).
+        // Single-segment uppercase-starting identifiers are treated as type
+        // generics — emit a TritonElem trait dispatch to resolve at
+        // monomorphization time. `vec_add::<f32, ...>` then picks
+        // `<f32 as TritonElem>::ir_type() = Type::F32`.
+        other if path.segments.len() == 1
+            && other.starts_with(|c: char| c.is_ascii_uppercase()) =>
+        {
+            let ident = &seg.ident;
+            Ok(quote! { <#ident as ::triton_ir::ty::TritonElem>::ir_type() })
+        }
         other => Err(syn::Error::new(
             seg.span(),
             format!(
                 "unsupported type `{}` in #[triton_kernel] signature \
-                 (Phase 3.1 supports i1/i32/i64/f16/f32/bf16 and Ptr<T>)",
+                 (Phase 3.1 supports i1/i32/i64/f16/f32/bf16, Ptr<T>, and uppercase generic type params bound by TritonElem)",
                 other
             ),
         )),

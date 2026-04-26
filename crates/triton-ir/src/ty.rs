@@ -110,6 +110,40 @@ impl fmt::Display for Type {
     }
 }
 
+/// Mapping from a Rust marker type (e.g. `f32`, `f16`, `i32`) to its
+/// MLIR-side [`Type`]. Lets dtype-generic kernels written like
+/// `pub fn vec_add<T: TritonElem, const BLOCK: usize>(...)` resolve `T`
+/// to the right [`Type`] at IR-build time without the proc-macro
+/// having to bake the dtype into the function name.
+///
+/// Implementations exist for the float types (`f32`, `f16`, `bf16`)
+/// and the integer types we expose in the DSL (`i1`, `i8`, `i16`,
+/// `i32`, `i64`). To use a custom marker type, implement this trait.
+pub trait TritonElem {
+    /// The MLIR element type for `Self`.
+    fn ir_type() -> Type;
+}
+
+/// Marker for IEEE half-precision (f16). Sized to one byte for
+/// `Ptr<f16>` to make sense in a kernel signature.
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct f16;
+/// Marker for bfloat16.
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct bf16;
+
+impl TritonElem for f32 { fn ir_type() -> Type { Type::F32 } }
+impl TritonElem for f64 { fn ir_type() -> Type { Type::F64 } }
+impl TritonElem for f16 { fn ir_type() -> Type { Type::F16 } }
+impl TritonElem for bf16 { fn ir_type() -> Type { Type::BF16 } }
+impl TritonElem for i8 { fn ir_type() -> Type { Type::I8 } }
+impl TritonElem for i16 { fn ir_type() -> Type { Type::I16 } }
+impl TritonElem for i32 { fn ir_type() -> Type { Type::I32 } }
+impl TritonElem for i64 { fn ir_type() -> Type { Type::I64 } }
+impl TritonElem for bool { fn ir_type() -> Type { Type::I1 } }
+
 #[cfg(test)]
 mod tests {
     use super::*;
