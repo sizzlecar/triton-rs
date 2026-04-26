@@ -185,13 +185,17 @@ mod compile_triton {
             .define("MLIR_DIR", llvm_root.join("lib/cmake/mlir"))
             .out_dir(out_dir.join("triton-build"));
 
-        // cmake-rs's `build_target` only takes one target; for multiple,
-        // pass them via `--target X --target Y ...` through `build_arg`.
-        // (The fallback "build everything" tries to compile bin/ tools
-        // which we don't need and which can fail on macOS.)
+        // cmake-rs runs `cmake --build PATH --config Release -- BUILD_ARGS`,
+        // so `build_arg` lands at the underlying build tool (make on Linux,
+        // not cmake itself). Pass target names directly as positional make
+        // args (`make TARGET1 TARGET2 ...`) instead of `--target` which is
+        // a cmake flag, not a make flag.
         for t in LIB_TARGETS {
-            cfg.build_arg("--target").build_arg(*t);
+            cfg.build_arg(*t);
         }
+        // -k = keep-going: don't bail on first failed target so we get
+        //      maximum coverage when bumping Triton versions.
+        cfg.build_arg("-k");
 
         let dst = cfg.build();
         eprintln!("triton-sys: cmake build root = {}", dst.display());
