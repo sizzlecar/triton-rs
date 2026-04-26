@@ -603,6 +603,16 @@ fn translate_call(
         if matches!(n, "to_f32" | "to_f16" | "to_i32") {
             return translate_method_call_1arg(call, n, hoist, counter);
         }
+        // Generic dtype cast: `as_t::<T>(x)` →
+        //   `__triton_f.cast_with_elem(x, <T as TritonElem>::ir_type())`.
+        // Lets dtype-generic kernels write `as_t::<T>(out_v)` to downcast a
+        // f32-internal accumulator to the kernel's parametric T at store
+        // time. Required for f16 attention because NVPTX has no native f16
+        // div / math.exp — the body must compute in f32 with explicit casts
+        // at the boundaries.
+        if n == "as_t" {
+            return translate_as_t(call, hoist, counter);
+        }
     }
 
     // Args to a call are always evaluated to a temporary first to avoid
@@ -624,6 +634,71 @@ fn translate_call(
     };
 
     Ok(maybe_hoist(setup, call_expr, kind, hoist, counter))
+}
+
+/// Translate `as_t::<T>(x)` into a direct
+/// `__triton_f.cast_with_elem(x, <T as TritonElem>::ir_type())` call. The
+/// type argument is parsed straight off the path's turbofish — it can be
+/// any single Rust type token (a kernel generic param `T`, or a concrete
+/// type like `f32`).
+fn translate_as_t(
+    call: &ExprCall,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    if call.args.len() != 1 {
+        return Err(syn::Error::new(
+            call.span(),
+            format!("`as_t` expects 1 argument, got {}", call.args.len()),
+        ));
+    }
+    // Pull the turbofish target type out of `as_t::<T>(...)`. Without a
+    // type arg there's nothing to cast to — that's a user error.
+    let ty_arg = match &*call.func {
+        Expr::Path(p) if p.qself.is_none() => {
+            let seg = p.path.segments.last().ok_or_else(|| {
+                syn::Error::new(p.span(), "as_t: empty function path")
+            })?;
+            match &seg.arguments {
+                PathArguments::AngleBracketed(a) => a
+                    .args
+                    .iter()
+                    .find_map(|g| match g {
+                        syn::GenericArgument::Type(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        syn::Error::new(
+                            a.span(),
+                            "as_t::<T>(x): T must be a type argument",
+                        )
+                    })?,
+                _ => {
+                    return Err(syn::Error::new(
+                        seg.span(),
+                        "as_t requires a turbofish type argument: as_t::<T>(x)",
+                    ));
+                }
+            }
+        }
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "as_t must be called as a bare path: as_t::<T>(x)",
+            ));
+        }
+    };
+
+    let a_t = translate_expr(&call.args[0], /*hoist=*/ true, counter)?;
+    let setup = a_t.setup;
+    let a = a_t.expr;
+    let call_expr = quote! {
+        __triton_f.cast_with_elem(
+            #a,
+            <#ty_arg as ::triton_ir::ty::TritonElem>::ir_type(),
+        )
+    };
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
 }
 
 /// Translate `to_f32(x)` / `to_f16(x)` / `to_i32(x)` into a direct

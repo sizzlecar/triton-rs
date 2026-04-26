@@ -55,3 +55,44 @@ fn dtype_generic_two_instances_yield_distinct_funcs() {
     let f16_text = vec_add_generic::<f16, 1024>::mlir();
     assert_ne!(f32_text, f16_text);
 }
+
+/// `as_t::<T>(x)` — generic dtype cast for the f32-internal compute
+/// pattern. Body computes the running sum in f32 (so f16 reductions
+/// don't overflow on activations of magnitude > 256) and downcasts to T
+/// at the store boundary.
+#[triton_kernel]
+fn cast_at_store_generic<T: TritonElem, const BLOCK: usize>(
+    a: Ptr<T>,
+    out: Ptr<T>,
+    n: i32,
+) {
+    let pid = program_id(0);
+    let off = pid * (BLOCK as i32) + make_range(0, BLOCK as i32);
+    let mask = off < n;
+    let av = load(a + off, mask);
+    let av_f32 = to_f32(av);
+    let scaled = av_f32 * 2.0_f32;
+    let out_v = as_t::<T>(scaled);
+    store(out + off, out_v, mask);
+}
+
+#[test]
+fn as_t_f32_no_op_emits_only_f32() {
+    let text = cast_at_store_generic::<f32, 1024>::mlir();
+    eprintln!("===== as_t f32 =====\n{text}");
+    // Identity cast collapses; everything should be f32 throughout.
+    assert!(text.contains("tensor<1024xf32>"));
+    assert!(!text.contains("xf16>"));
+}
+
+#[test]
+fn as_t_f16_emits_truncf_at_store_boundary() {
+    let text = cast_at_store_generic::<f16, 1024>::mlir();
+    eprintln!("===== as_t f16 =====\n{text}");
+    // Load is f16, body is f32 (extf at load via to_f32, mul in f32),
+    // store boundary truncates back to f16 (truncf via as_t::<T>).
+    assert!(text.contains("tensor<1024xf16>"));
+    assert!(text.contains("tensor<1024xf32>"));
+    assert!(text.contains("\"arith.extf\""));
+    assert!(text.contains("\"arith.truncf\""));
+}

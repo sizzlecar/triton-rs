@@ -59,10 +59,12 @@ fn main() {
         "flash_decode_attn_phase2_f32"      => flash_decode_attn_phase2_f32::<128, 32>::mlir(),
         "batched_flash_decode_attn_phase1_f32"
                                             => batched_flash_decode_attn_phase1_f32::<128, 32>::mlir(),
-        // flash_attn_full is dtype-generic via TritonElem; both f32 and
-        // f16 round-trip through Triton thanks to coerce_elemwise's
-        // implicit scalar-dtype-to-tensor-elem cast (Python @triton.jit
-        // semantics).
+        // flash_attn_full IS dtype-generic in source — same body emits
+        // f32 or f16 depending on T. Internal compute always runs in f32
+        // (Q/K/V upcast on load, downcast via `as_t::<T>` at store) so
+        // the f16 instantiation works around NVPTX's lack of native f16
+        // division / `math.exp` instructions. BLOCK_Q is 1 here as a
+        // dump-only sanity check; real prefill runs use BLOCK_Q ≥ 32.
         "flash_attn_full_f32"               => flash_attn_full::<f32, 128, 1, 32>::mlir(),
         "flash_attn_full_f16"               => flash_attn_full::<f16, 128, 1, 32>::mlir(),
     ];

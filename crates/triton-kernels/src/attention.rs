@@ -700,6 +700,14 @@ pub fn batched_flash_decode_attn_phase1_f32<const HEAD_DIM: usize, const BLOCK_K
 /// Launch: grid = (ceil(q_len / BLOCK_Q), num_heads, batch).
 /// v0 assumes `q_len % BLOCK_Q == 0`, `kv_len % BLOCK_KV == 0`,
 /// `head_dim == HEAD_DIM`.
+///
+/// **Internal compute is f32 regardless of T.** Q/K/V are loaded at T's
+/// element type then upcast via `to_f32`; m_i / l_i / acc / scores all
+/// run in f32 throughout the loop; the final accumulator is downcast
+/// back to T via `as_t::<T>(out_v)` at the store boundary. This is
+/// required for f16 because NVPTX has no native f16 division or
+/// `math.exp` instructions, and matches Python @triton.jit's strategy
+/// for mixed-precision attention.
 #[triton_kernel]
 pub fn flash_attn_full<
     T: TritonElem,
@@ -733,25 +741,28 @@ pub fn flash_attn_full<
 
     // Per-batch, per-head Q row base: b*(num_heads*q_len*head_dim) + h*(q_len*head_dim)
     let q_batch_base = batch * num_heads * q_len * head_dim + head * q_len * head_dim;
-    // Q tile [BLOCK_Q, HEAD_DIM]
+    // Q tile [BLOCK_Q, HEAD_DIM] — load at T then immediately upcast to
+    // f32 so all downstream math stays in f32 (see kernel doc-comment).
     let q_row_base = q_pos_range * head_dim + q_batch_base;
     let q_row_2d = expand_dims(q_row_base, 1);
     let dim_2d = expand_dims(dim_range, 0);
     let q_off_2d = q_row_2d + dim_2d;
-    let q_tile = load(q + q_off_2d);
+    let q_tile_t = load(q + q_off_2d);
+    let q_tile = to_f32(q_tile_t);
 
     // KV tile pointer base (per-batch, per-kv-head).
     let kv_batch_base = batch * num_kv_heads * kv_len * head_dim
         + kv_head * kv_len * head_dim;
     let kv_blocks = kv_len / (BLOCK_KV as i32);
 
-    // Online softmax state: m_i [BLOCK_Q], l_i [BLOCK_Q], acc [BLOCK_Q, HEAD_DIM]
-    // Build init tensors of the right shape by re-loading Q col 0
-    // (cheap; the proc-macro doesn't yet have a "zeros tensor" builder).
-    let q_col0 = load(q + q_pos_range * head_dim + q_batch_base); // [BLOCK_Q]
+    // Online softmax state: m_i [BLOCK_Q], l_i [BLOCK_Q], acc [BLOCK_Q, HEAD_DIM].
+    // Build init tensors by multiplying q_tile by 0 — q_tile is f32 here
+    // so the init state inherits f32 element type, regardless of T.
+    let q_col0_t = load(q + q_pos_range * head_dim + q_batch_base);
+    let q_col0 = to_f32(q_col0_t); // [BLOCK_Q] f32
     let m_i_init = q_col0 * 0.0_f32 - 1.0e30_f32;
     let l_i_init = q_col0 * 0.0_f32;
-    let acc_init = q_tile * 0.0_f32; // [BLOCK_Q, HEAD_DIM]
+    let acc_init = q_tile * 0.0_f32; // [BLOCK_Q, HEAD_DIM] f32
 
     let (_, l_i, acc) = scf_for(
         const_i32(0),
@@ -762,12 +773,14 @@ pub fn flash_attn_full<
             let kv_pos_base = kb * (BLOCK_KV as i32);
             let kv_pos_range = make_range(0, BLOCK_KV as i32) + kv_pos_base;
 
-            // K tile [BLOCK_KV, HEAD_DIM]
+            // K tile [BLOCK_KV, HEAD_DIM] — load at T then upcast.
             let k_row_base = kv_pos_range * head_dim + kv_batch_base;
             let k_row_2d = expand_dims(k_row_base, 1);
             let k_off_2d = k_row_2d + dim_2d;
-            let k_tile = load(k + k_off_2d);
-            let v_tile = load(v + k_off_2d);
+            let k_tile_t = load(k + k_off_2d);
+            let v_tile_t = load(v + k_off_2d);
+            let k_tile = to_f32(k_tile_t);
+            let v_tile = to_f32(v_tile_t);
 
             // scores[BLOCK_Q, BLOCK_KV] = Q_tile[BLOCK_Q, HD] · K_tile[BLOCK_KV, HD]^T
             // Computed as broadcast-mul-reduce on a 3D intermediate:
@@ -811,8 +824,12 @@ pub fn flash_attn_full<
     );
 
     // ── normalize + write ──
+    // out_v_f32 is f32 (acc and l_i_2d are both f32). Downcast to T via
+    // as_t::<T>(...) so the store matches the output pointer's element
+    // type. For T == f32 the cast is a no-op.
     let l_i_2d = expand_dims(l_i, 1);
-    let out_v = acc / l_i_2d;
+    let out_v_f32 = acc / l_i_2d;
+    let out_v = as_t::<T>(out_v_f32);
     let out_row_base = q_pos_range * head_dim + q_batch_base;
     let out_row_2d = expand_dims(out_row_base, 1);
     let out_off_2d = out_row_2d + dim_2d;

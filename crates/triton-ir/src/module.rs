@@ -569,8 +569,9 @@ impl<'m> FuncBuilder<'m> {
     /// `float → float` widening/narrowing → `arith.extf` / `arith.truncf`,
     /// `int → int` widening/narrowing → `arith.extsi` / `arith.trunci`.
     /// Identity casts (input already at the target elem type) pass through.
-    /// Tensor inputs preserve shape.
-    fn cast_with_elem(&mut self, x: Value, target_elem: Type) -> Value {
+    /// Tensor inputs preserve shape. `pub` so dtype-generic kernels can
+    /// reach it through the DSL `as_t::<T>(x)` helper.
+    pub fn cast_with_elem(&mut self, x: Value, target_elem: Type) -> Value {
         let in_elem = match x.ty() {
             Type::Tensor { elem, .. } => (**elem).clone(),
             other => other.clone(),
