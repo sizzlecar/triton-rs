@@ -54,6 +54,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
 
+    // v3.6 implicit kernel args: the lowering pipeline appends two extra
+    // device-pointer slots (global_scratch + profile_scratch) after the
+    // user-defined args. Sizes come from the metadata; for simple
+    // element-wise kernels both are usually 0, but the pointer slots are
+    // still mandatory or the launch SIGSEGVs at arg-marshalling time.
+    let global_scratch_size =
+        meta["global_scratch_size"].as_u64().unwrap_or(0) as usize;
+    let profile_scratch_size =
+        meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
+
     // 2. Tile size is hard-coded to 1024 to match `dump_vec_add_generic`.
     const BLOCK: u32 = 1024;
     const N: usize = 4096; // total elements; gives a 4-block grid
@@ -79,6 +89,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev_y = dev.htod_copy(host_y.clone())?;
     let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
 
+    // v3.6 implicit-arg buffers. Allocate at least 1 byte even when the
+    // metadata reports size 0 — cudarc's auto-marshaller needs a real
+    // CudaSlice to produce a CUdeviceptr; the kernel just won't read it
+    // when the lowering pass set the size to 0.
+    let scratch: cudarc::driver::CudaSlice<u8> =
+        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+    let profile_scratch: cudarc::driver::CudaSlice<u8> =
+        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+
     // 5. Launch — Triton kernels expect (num_warps * 32) threads per block,
     //    and one block per BLOCK-element tile.
     let grid_x = ((N as u32) + BLOCK - 1) / BLOCK;
@@ -90,9 +109,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let n_arg: i32 = N as i32;
     unsafe {
-        // Triton's calling convention for our vec_add: 3 pointers + 1 i32.
-        // cudarc auto-marshals CudaSlice<T> as a device pointer.
-        func.launch(cfg, (&dev_x, &dev_y, &mut dev_out, n_arg))?;
+        // v3.6 calling convention: 3 user pointers + 1 i32 + global_scratch
+        // device-ptr + profile_scratch device-ptr (the lowering pipeline
+        // appends both unconditionally; v3.2 didn't).
+        func.launch(
+            cfg,
+            (
+                &dev_x,
+                &dev_y,
+                &mut dev_out,
+                n_arg,
+                &scratch,
+                &profile_scratch,
+            ),
+        )?;
     }
 
     dev.synchronize()?;
