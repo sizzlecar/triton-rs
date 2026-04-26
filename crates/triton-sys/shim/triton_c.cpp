@@ -55,6 +55,7 @@
 // NVIDIA-specific (lives under third_party/nvidia/include — the CMakeLists
 // adds third_party as an include root so these resolve as <Dialect/...>).
 #include "Dialect/NVGPU/IR/Dialect.h"
+#include "NVGPUToLLVM/Passes.h"            // declares mlir::triton::createConvertNVGPUToLLVM in v3.6
 #include "NVGPUToLLVM/NVGPUToLLVMPass.h"
 #include "TritonNVIDIAGPUToLLVM/Passes.h"
 
@@ -215,9 +216,10 @@ static void build_ttgir_pipeline(
     pm.addPass(createSymbolDCEPass());
 
     if (capability / 10 >= 9) {
-        // v3.6: drop "Pass" suffix; takes capability arg.
-        pm.addPass(triton::gpu::createTritonGPUFenceInsertion());
-        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUTMALowering());
+        // v3.6 names: TritonGPUFenceInsertion (no Pass suffix) lives in
+        // nvidia_gpu namespace; TMALoweringPass keeps the suffix.
+        pm.addPass(triton::nvidia_gpu::createTritonGPUFenceInsertion());
+        pm.addPass(triton::nvidia_gpu::createTritonNvidiaGPUTMALoweringPass());
     }
     pm.addPass(createCanonicalizerPass());
 }
