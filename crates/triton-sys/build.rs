@@ -219,7 +219,10 @@ mod compile_triton {
             .include(crate_dir.join("shim"))
             .include(vendor_dir.join("include"))
             .include(vendor_dir.join("third_party"))
-            .include(triton_build.join("include")) // tablegen'd
+            .include(vendor_dir.join("third_party/nvidia/include"))
+            // Tablegen outputs land under triton-build/build/{include,third_party/...}.
+            .include(triton_build.join("build/include"))
+            .include(triton_build.join("build/third_party/nvidia/include"))
             .include(llvm_root.join("include"))
             .flag("-std=c++17")
             .flag("-fPIC")
