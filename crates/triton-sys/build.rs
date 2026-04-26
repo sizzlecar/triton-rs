@@ -149,9 +149,32 @@ mod compile_triton {
     }
 
     /// Step 3 — drive Triton's cmake. Returns the cmake build root.
+    ///
+    /// Builds only the library targets we need to link the shim against
+    /// (no `bin/` tools — `triton-opt`, `triton-lsp`, etc. are not part
+    /// of our ABI surface and have known cross-platform compile issues
+    /// in v3.2.0). The list comes from inspecting Triton's own
+    /// `add_triton_library` calls; verified by `cmake --build . --target help`.
     fn build_triton(vendor_dir: &PathBuf, llvm_root: &PathBuf, out_dir: &PathBuf) -> PathBuf {
-        let dst = cmake::Config::new(vendor_dir)
-            .define("TRITON_BUILD_TUTORIALS", "OFF")
+        const LIB_TARGETS: &[&str] = &[
+            "TritonIR",
+            "TritonAnalysis",
+            "TritonTransforms",
+            "TritonGPUIR",
+            "TritonGPUTransforms",
+            "TritonGPUToLLVM",
+            "TritonToTritonGPU",
+            "TritonLLVMIR",
+            "TritonTools",
+            "NVGPUIR",
+            "NVGPUToLLVM",
+            "TritonNvidiaGPUIR",
+            "TritonNvidiaGPUTransforms",
+            "TritonNVIDIAGPUToLLVM",
+        ];
+
+        let mut cfg = cmake::Config::new(vendor_dir);
+        cfg.define("TRITON_BUILD_TUTORIALS", "OFF")
             .define("TRITON_BUILD_PYTHON_MODULE", "OFF")
             .define("TRITON_BUILD_PROTON", "OFF")
             .define("TRITON_BUILD_UT", "OFF")
@@ -160,8 +183,17 @@ mod compile_triton {
             .define("LLVM_LIBRARY_DIR", llvm_root.join("lib"))
             .define("LLVM_INCLUDE_DIRS", llvm_root.join("include"))
             .define("MLIR_DIR", llvm_root.join("lib/cmake/mlir"))
-            .out_dir(out_dir.join("triton-build"))
-            .build();
+            .out_dir(out_dir.join("triton-build"));
+
+        // cmake-rs's `build_target` only takes one target; for multiple,
+        // pass them via `--target X --target Y ...` through `build_arg`.
+        // (The fallback "build everything" tries to compile bin/ tools
+        // which we don't need and which can fail on macOS.)
+        for t in LIB_TARGETS {
+            cfg.build_arg("--target").build_arg(*t);
+        }
+
+        let dst = cfg.build();
         eprintln!("triton-sys: cmake build root = {}", dst.display());
         dst
     }
