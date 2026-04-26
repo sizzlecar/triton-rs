@@ -11,8 +11,13 @@ description = "User-facing facade: re-exports the common triton-rs API"
 default = ["cpu-emulation"]
 cpu-emulation = ["triton-runtime/cpu-emulation"]
 cuda = ["triton-runtime/cuda"]
+# Forwards triton-sys's compile-triton (Linux + CUDA only). Enables
+# the in-process MLIR -> cubin path; without it `Kernel::compile()`
+# returns NotCompiled.
+compile-triton = ["triton-sys/compile-triton"]
 
 [dependencies]
 triton-ir.workspace = true
 triton-runtime.workspace = true
+triton-sys.workspace = true
 triton-dsl.workspace = true
