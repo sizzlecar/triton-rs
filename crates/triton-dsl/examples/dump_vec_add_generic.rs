@@ -18,5 +18,7 @@ fn vec_add<const BLOCK: usize>(x: Ptr<f32>, y: Ptr<f32>, out: Ptr<f32>, n: i32) 
 }
 
 fn main() {
-    print!("{}", vec_add::<512>::mlir());
+    // BLOCK=1024 matches the runtime example (`run_vec_add`) so the
+    // compiled kernel and the launch parameters agree on tile width.
+    print!("{}", vec_add::<1024>::mlir());
 }
