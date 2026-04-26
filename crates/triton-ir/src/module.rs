@@ -351,53 +351,100 @@ impl<'m> FuncBuilder<'m> {
     // `crate::ops::add(&mut __triton_f, ...)` would need explicit reborrow
     // at every call site inside a closure (`&mut *__triton_f`), which we'd
     // rather not bake into the proc-macro's emit code paths.
+    //
+    // All binary ops auto-broadcast a scalar operand to match a tensor one
+    // via `tt.splat`, so users can write `tensor + scalar` (or `ptr + i32`
+    // — even works for tt.addptr) without sprinkling splat_1d everywhere.
 
-    /// Type-dispatched `+`. See [`crate::ops::add`].
+    /// Coerce a scalar/tensor pair into matching shapes for an element-wise
+    /// op: if exactly one side is a tensor, splat the scalar to its shape.
+    /// Same-shape inputs pass through. Two tensors with mismatched shapes
+    /// are a logic error and panic — no rank-broadcast for now.
+    fn coerce_elemwise(&mut self, a: Value, b: Value) -> (Value, Value) {
+        let a_t = matches!(a.ty(), Type::Tensor { .. });
+        let b_t = matches!(b.ty(), Type::Tensor { .. });
+        match (a_t, b_t) {
+            (true, false) => {
+                let shape = if let Type::Tensor { shape, .. } = a.ty() {
+                    shape.clone()
+                } else {
+                    unreachable!()
+                };
+                let b_splat = self.op_one(crate::dialect::tt::splat(b, shape));
+                (a, b_splat)
+            }
+            (false, true) => {
+                let shape = if let Type::Tensor { shape, .. } = b.ty() {
+                    shape.clone()
+                } else {
+                    unreachable!()
+                };
+                let a_splat = self.op_one(crate::dialect::tt::splat(a, shape));
+                (a_splat, b)
+            }
+            _ => (a, b),
+        }
+    }
+
+    /// Type-dispatched `+`. Auto-broadcasts scalar → tensor (and ptr-tensor
+    /// + scalar-i32 etc. when chained through splat). See [`crate::ops::add`].
     pub fn add(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::add(self, a, b)
     }
     /// Type-dispatched `-`. See [`crate::ops::sub`].
     pub fn sub(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::sub(self, a, b)
     }
     /// Type-dispatched `*`. See [`crate::ops::mul`].
     pub fn mul(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::mul(self, a, b)
     }
     /// Type-dispatched `/`. See [`crate::ops::div`].
     pub fn div(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::div(self, a, b)
     }
     /// Type-dispatched `max`. See [`crate::ops::max`].
     pub fn max(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::max(self, a, b)
     }
     /// Type-dispatched `min`. See [`crate::ops::min`].
     pub fn min(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::min(self, a, b)
     }
     /// Type-dispatched `<`. See [`crate::ops::lt`].
     pub fn lt(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::lt(self, a, b)
     }
     /// Type-dispatched `<=`. See [`crate::ops::le`].
     pub fn le(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::le(self, a, b)
     }
     /// Type-dispatched `>`. See [`crate::ops::gt`].
     pub fn gt(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::gt(self, a, b)
     }
     /// Type-dispatched `>=`. See [`crate::ops::ge`].
     pub fn ge(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::ge(self, a, b)
     }
     /// Type-dispatched `==`. See [`crate::ops::eq`].
     pub fn eq(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::eq(self, a, b)
     }
     /// Type-dispatched `!=`. See [`crate::ops::ne`].
     pub fn ne(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
         crate::ops::ne(self, a, b)
     }
 
