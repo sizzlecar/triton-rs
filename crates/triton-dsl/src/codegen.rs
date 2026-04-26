@@ -576,6 +576,12 @@ fn translate_call(
         if matches!(n, "max" | "min") {
             return translate_method_call_2arg(call, n, hoist, counter);
         }
+        // Casts: same reason as max/min — these route through inherent
+        // FuncBuilder methods that already return Value, so they must
+        // bypass the generic `op_one(spec)` wrapper.
+        if matches!(n, "to_f32" | "to_f16" | "to_i32") {
+            return translate_method_call_1arg(call, n, hoist, counter);
+        }
     }
 
     // Args to a call are always evaluated to a temporary first to avoid
@@ -597,6 +603,29 @@ fn translate_call(
     };
 
     Ok(maybe_hoist(setup, call_expr, kind, hoist, counter))
+}
+
+/// Translate `to_f32(x)` / `to_f16(x)` / `to_i32(x)` into a direct
+/// FuncBuilder method call. Lives in the special-form list so it doesn't
+/// get double-wrapped by op_spec_for's `op_one(...)` envelope.
+fn translate_method_call_1arg(
+    call: &ExprCall,
+    method: &str,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    if call.args.len() != 1 {
+        return Err(syn::Error::new(
+            call.span(),
+            format!("`{}` expects 1 argument, got {}", method, call.args.len()),
+        ));
+    }
+    let a_t = translate_expr(&call.args[0], /*hoist=*/ true, counter)?;
+    let setup = a_t.setup;
+    let a = a_t.expr;
+    let method_ident = format_ident!("{}", method);
+    let call_expr = quote! { __triton_f.#method_ident(#a) };
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
 }
 
 /// Translate `max(a, b)` / `min(a, b)` into a direct FuncBuilder method
@@ -641,21 +670,19 @@ fn translate_scf_for(
         ));
     }
 
-    // Translate the four leading scalar/Value args normally — force-hoist
-    // each into a temp so they evaluate before the closure runs.
+    // Translate the three leading scalar/Value args normally — force-hoist
+    // each into a temp so they evaluate before the closure runs. The init
+    // arg is handled below alongside multi-iter_arg tuple unpacking.
     let lb_t = translate_expr(&call.args[0], /*hoist=*/ true, counter)?;
     let ub_t = translate_expr(&call.args[1], /*hoist=*/ true, counter)?;
     let step_t = translate_expr(&call.args[2], /*hoist=*/ true, counter)?;
-    let init_t = translate_expr(&call.args[3], /*hoist=*/ true, counter)?;
     let mut setup = Vec::new();
     setup.extend(lb_t.setup);
     setup.extend(ub_t.setup);
     setup.extend(step_t.setup);
-    setup.extend(init_t.setup);
     let lb = lb_t.expr;
     let ub = ub_t.expr;
     let step = step_t.expr;
-    let init = init_t.expr;
 
     // Final arg must be a closure with exactly two parameters.
     let closure: &ExprClosure = match &call.args[4] {
@@ -670,58 +697,186 @@ fn translate_scf_for(
     if closure.inputs.len() != 2 {
         return Err(syn::Error::new(
             closure.span(),
-            "scf_for closure must take exactly 2 parameters: |induction, iter_arg|",
+            "scf_for closure must take exactly 2 parameters: |induction, iter_arg(s)|",
         ));
     }
     let i_ident = closure_param_ident(&closure.inputs[0])?;
-    let acc_ident = closure_param_ident(&closure.inputs[1])?;
+
+    // Iter-arg side: either a single `Pat::Ident` (one iter_arg, the
+    // common case) OR a `Pat::Tuple` of identifiers (multi iter_args
+    // for kernels that thread several state values through the loop —
+    // e.g. flash-attention's (m_i, l_i, acc) running stats).
+    let acc_idents = pat_to_ident_list(&closure.inputs[1])?;
+    let n_iter = acc_idents.len();
+    if n_iter == 0 {
+        return Err(syn::Error::new(
+            closure.inputs[1].span(),
+            "scf_for: iter_arg slot needs at least one identifier",
+        ));
+    }
+
+    // The user-supplied init value can match: a single value when n_iter == 1,
+    // or an `Expr::Tuple` of n_iter values when there are multiple iter_args.
+    let init_exprs = expr_to_value_list(&call.args[3], n_iter)?;
+    let mut init_value_tokens = Vec::new();
+    for e in &init_exprs {
+        let t = translate_expr(e, /*hoist=*/ true, counter)?;
+        setup.extend(t.setup);
+        init_value_tokens.push(t.expr);
+    }
 
     // The closure body can be a block `{ stmts; trailing_expr }` or a bare
     // expression (when the user writes `|i, acc| acc + i`). Treat the bare-
     // expression form as a body with no preceding statements, just a yield.
-    let (init_stmts, yield_t) = match &*closure.body {
+    let (init_stmts, yield_t_collection) = match &*closure.body {
         Expr::Block(eb) => {
-            let (init, yield_expr) = split_block_for_yield(&eb.block, counter)?;
-            let y = translate_expr(yield_expr, /*hoist=*/ false, counter)?;
-            (init, y)
+            let (init_st, yield_expr) = split_block_for_yield(&eb.block, counter)?;
+            // Yield must match n_iter values too — single value or n-tuple.
+            let yield_exprs = expr_to_value_list(yield_expr, n_iter)?;
+            let mut yield_translated = Vec::with_capacity(n_iter);
+            for e in &yield_exprs {
+                yield_translated.push(translate_expr(e, /*hoist=*/ false, counter)?);
+            }
+            (init_st, yield_translated)
         }
         other => {
-            // No setup statements — the entire body IS the yield expression.
-            (Vec::new(), translate_expr(other, /*hoist=*/ false, counter)?)
+            let yield_exprs = expr_to_value_list(other, n_iter)?;
+            let mut yield_translated = Vec::with_capacity(n_iter);
+            for e in &yield_exprs {
+                yield_translated.push(translate_expr(e, /*hoist=*/ false, counter)?);
+            }
+            (Vec::new(), yield_translated)
         }
     };
-    let yield_setup = yield_t.setup;
-    let yield_expr_ts = yield_t.expr;
 
-    // Assemble the closure body: bind the closure's user-named params to
-    // the scf.for entry-block args, then run the user body, then yield.
+    // Bind each iter_arg to its body-visible name.
+    let acc_bindings = acc_idents.iter().enumerate().map(|(i, name)| {
+        quote! { let #name = __triton_iter_args[#i].clone(); }
+    });
+
+    // Per-yield setup + value extraction.
+    let mut yield_setups = Vec::new();
+    let mut yield_values = Vec::new();
+    for (i, ye) in yield_t_collection.iter().enumerate() {
+        yield_setups.extend(ye.setup.clone());
+        let v = &ye.expr;
+        let tmp = format_ident!("__triton_yield_{}", i);
+        yield_setups.push(quote! { let #tmp = #v; });
+        yield_values.push(quote! { #tmp });
+    }
+
     let closure_body = quote! {
         let #i_ident = __triton_i;
-        let #acc_ident = __triton_iter_args[0].clone();
+        #(#acc_bindings)*
         #(#init_stmts)*
-        #(#yield_setup)*
-        let __triton_yield = #yield_expr_ts;
-        ::std::vec![__triton_yield]
+        #(#yield_setups)*
+        ::std::vec![#(#yield_values),*]
     };
 
-    let call_expr = quote! {
-        {
-            let __triton_results = __triton_f.for_loop_with(
-                #lb, #ub, #step,
-                ::std::vec![#init],
-                |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>,
-                 __triton_i: ::triton_ir::value::Value,
-                 __triton_iter_args: ::std::vec::Vec<::triton_ir::value::Value>|
-                 -> ::std::vec::Vec<::triton_ir::value::Value> {
-                    #closure_body
-                },
-            );
-            __triton_results.into_iter().next()
-                .expect("scf_for must yield exactly one iter_arg result")
+    let init_vec = quote! { ::std::vec![#(#init_value_tokens),*] };
+    let call_expr = if n_iter == 1 {
+        quote! {
+            {
+                let __triton_results = __triton_f.for_loop_with(
+                    #lb, #ub, #step,
+                    #init_vec,
+                    |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>,
+                     __triton_i: ::triton_ir::value::Value,
+                     __triton_iter_args: ::std::vec::Vec<::triton_ir::value::Value>|
+                     -> ::std::vec::Vec<::triton_ir::value::Value> {
+                        #closure_body
+                    },
+                );
+                __triton_results.into_iter().next()
+                    .expect("scf_for must yield exactly one iter_arg result")
+            }
+        }
+    } else {
+        // Returns a tuple of n_iter Values.
+        let result_idents: Vec<_> = (0..n_iter)
+            .map(|i| format_ident!("__triton_res_{}", i))
+            .collect();
+        let extracts = result_idents.iter().enumerate().map(|(i, id)| {
+            quote! { let #id = __triton_results[#i].clone(); }
+        });
+        let result_tuple = quote! { (#(#result_idents),*) };
+        quote! {
+            {
+                let __triton_results = __triton_f.for_loop_with(
+                    #lb, #ub, #step,
+                    #init_vec,
+                    |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>,
+                     __triton_i: ::triton_ir::value::Value,
+                     __triton_iter_args: ::std::vec::Vec<::triton_ir::value::Value>|
+                     -> ::std::vec::Vec<::triton_ir::value::Value> {
+                        #closure_body
+                    },
+                );
+                #(#extracts)*
+                #result_tuple
+            }
         }
     };
 
     Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
+}
+
+/// Extract a flat list of identifiers from a closure parameter pattern.
+/// Single `Pat::Ident` → one entry. `Pat::Tuple` of idents → that many.
+fn pat_to_ident_list(pat: &Pat) -> Result<Vec<proc_macro2::Ident>, syn::Error> {
+    match pat {
+        Pat::Ident(p) => Ok(vec![p.ident.clone()]),
+        Pat::Tuple(t) => {
+            let mut out = Vec::with_capacity(t.elems.len());
+            for elem in &t.elems {
+                match elem {
+                    Pat::Ident(pi) => out.push(pi.ident.clone()),
+                    Pat::Type(pt) => match &*pt.pat {
+                        Pat::Ident(pi) => out.push(pi.ident.clone()),
+                        other => return Err(syn::Error::new(
+                            other.span(),
+                            "tuple iter_arg elements must be plain identifiers",
+                        )),
+                    },
+                    other => return Err(syn::Error::new(
+                        other.span(),
+                        "tuple iter_arg elements must be plain identifiers",
+                    )),
+                }
+            }
+            Ok(out)
+        }
+        Pat::Type(pt) => pat_to_ident_list(&pt.pat),
+        other => Err(syn::Error::new(
+            other.span(),
+            "iter_arg pattern must be a plain identifier or a tuple of identifiers",
+        )),
+    }
+}
+
+/// Extract a list of expressions matching a target arity. Single value
+/// when `expected == 1`, `Expr::Tuple` when `expected > 1`.
+fn expr_to_value_list(expr: &Expr, expected: usize) -> Result<Vec<Expr>, syn::Error> {
+    match expr {
+        Expr::Tuple(t) if expected > 1 => {
+            if t.elems.len() != expected {
+                return Err(syn::Error::new(
+                    t.span(),
+                    format!("expected tuple of {} values, got {}", expected, t.elems.len()),
+                ));
+            }
+            Ok(t.elems.iter().cloned().collect())
+        }
+        Expr::Paren(p) if expected == 1 => Ok(vec![(*p.expr).clone()]),
+        other if expected == 1 => Ok(vec![other.clone()]),
+        other => Err(syn::Error::new(
+            other.span(),
+            format!(
+                "expected a tuple of {} values for multi-iter_arg scf_for",
+                expected
+            ),
+        )),
+    }
 }
 
 /// Translate `reduce(input, axis, |a, b| body)` into a call to
@@ -1043,6 +1198,9 @@ fn op_spec_for(
             CallKind::Value,
             quote! { ::triton_ir::dialect::tt::rsqrt(#(#args),*) },
         ),
+
+        // (Casts `to_f32` / `to_f16` / `to_i32` are handled in the
+        // special-form branch above, so they never reach this match.)
         "tanh" if n == 1 => (
             CallKind::Value,
             quote! { ::triton_ir::dialect::tt::tanh(#(#args),*) },

@@ -73,3 +73,37 @@ fn scf_for_result_threads_back_into_outer_scope() {
         "tt.store should follow scf.for in textual order:\n{text}"
     );
 }
+
+// Multi-iter_args path — flash-attention-style (running max + sum + acc).
+#[triton_kernel]
+fn sum_and_product(out_sum: Ptr<i32>, out_prod: Ptr<i32>) {
+    let lb = const_i32(0);
+    let ub = const_i32(5);
+    let step = const_i32(1);
+    let init_sum = const_i32(0);
+    let init_prod = const_i32(1);
+
+    let (s, p) = scf_for(lb, ub, step, (init_sum, init_prod), |i, (s, p)| {
+        let one = const_i32(1);
+        let i1 = i + one;
+        (s + i1, p * i1)
+    });
+
+    store(out_sum, s);
+    store(out_prod, p);
+}
+
+#[test]
+fn multi_iter_args_yield_tuple() {
+    let text = sum_and_product::mlir();
+    eprintln!("===== sum_and_product MLIR =====\n{text}\n================================");
+    // One scf.for that takes 2 iter_args and returns 2 results.
+    assert!(text.contains("\"scf.for\""));
+    // Body has both addi (s + i1) and muli (p * i1).
+    assert!(text.contains("\"arith.addi\""), "missing addi for sum:\n{text}");
+    assert!(text.contains("\"arith.muli\""), "missing muli for product:\n{text}");
+    // Two scf.yield operands → check the yield op carries 2 operand types.
+    assert!(text.contains("\"scf.yield\""));
+    // Two stores at the end (for out_sum and out_prod).
+    assert_eq!(text.matches("\"tt.store\"").count(), 2);
+}

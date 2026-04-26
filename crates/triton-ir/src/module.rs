@@ -480,6 +480,75 @@ impl<'m> FuncBuilder<'m> {
         }
     }
 
+    /// Element-type cast dispatcher used by `to_f32` / `to_f16` / `to_i32`.
+    ///
+    /// Dispatches on the input's element type vs the requested target:
+    /// `int → float` → `arith.sitofp`, `float → int` → `arith.fptosi`,
+    /// `float → float` widening/narrowing → `arith.extf` / `arith.truncf`,
+    /// `int → int` widening/narrowing → `arith.extsi` / `arith.trunci`.
+    /// Identity casts (input already at the target elem type) pass through.
+    /// Tensor inputs preserve shape.
+    fn cast_with_elem(&mut self, x: Value, target_elem: Type) -> Value {
+        let in_elem = match x.ty() {
+            Type::Tensor { elem, .. } => (**elem).clone(),
+            other => other.clone(),
+        };
+        if in_elem == target_elem {
+            return x;
+        }
+        let target_ty = match x.ty() {
+            Type::Tensor { shape, .. } => Type::tensor(shape.clone(), target_elem.clone()),
+            _ => target_elem.clone(),
+        };
+        let in_is_int = is_int_elem(&in_elem);
+        let in_is_float = is_float_elem(&in_elem);
+        let out_is_int = is_int_elem(&target_elem);
+        let out_is_float = is_float_elem(&target_elem);
+
+        let in_w = elem_bit_width(&in_elem);
+        let out_w = elem_bit_width(&target_elem);
+
+        let spec = if in_is_int && out_is_float {
+            crate::dialect::arith::sitofp(x, target_ty)
+        } else if in_is_float && out_is_int {
+            crate::dialect::arith::fptosi(x, target_ty)
+        } else if in_is_float && out_is_float {
+            if out_w > in_w {
+                crate::dialect::arith::extf(x, target_ty)
+            } else {
+                crate::dialect::arith::truncf(x, target_ty)
+            }
+        } else if in_is_int && out_is_int {
+            if out_w > in_w {
+                crate::dialect::arith::extsi(x, target_ty)
+            } else {
+                crate::dialect::arith::trunci(x, target_ty)
+            }
+        } else {
+            panic!(
+                "cast_with_elem: unsupported cast {} → {}",
+                in_elem, target_elem
+            );
+        };
+        self.op_one(spec)
+    }
+
+    /// Cast a value's element type to `f32`. Tensor inputs preserve shape.
+    /// No-op if already `f32`.
+    pub fn to_f32(&mut self, x: Value) -> Value {
+        self.cast_with_elem(x, Type::F32)
+    }
+    /// Cast a value's element type to `f16`. Tensor inputs preserve shape.
+    /// No-op if already `f16`.
+    pub fn to_f16(&mut self, x: Value) -> Value {
+        self.cast_with_elem(x, Type::F16)
+    }
+    /// Cast a value's element type to `i32` (truncating for floats / wider
+    /// integers). Tensor inputs preserve shape. No-op if already `i32`.
+    pub fn to_i32(&mut self, x: Value) -> Value {
+        self.cast_with_elem(x, Type::I32)
+    }
+
     /// Build a Value from a Rust float literal matching `sample`'s
     /// element type. Float literals can only land in float types.
     pub fn lit_f64(&mut self, sample: &Value, lit: f64) -> Value {
@@ -509,6 +578,25 @@ impl<'m> FuncBuilder<'m> {
             return_types: std::mem::take(&mut self.return_types),
             body: std::mem::take(&mut self.body),
         });
+    }
+}
+
+fn is_int_elem(t: &Type) -> bool {
+    matches!(t, Type::I1 | Type::I8 | Type::I16 | Type::I32 | Type::I64)
+}
+
+fn is_float_elem(t: &Type) -> bool {
+    matches!(t, Type::F16 | Type::F32 | Type::F64 | Type::BF16)
+}
+
+fn elem_bit_width(t: &Type) -> u32 {
+    match t {
+        Type::I1 => 1,
+        Type::I8 => 8,
+        Type::I16 | Type::F16 | Type::BF16 => 16,
+        Type::I32 | Type::F32 => 32,
+        Type::I64 | Type::F64 => 64,
+        _ => 0,
     }
 }
 

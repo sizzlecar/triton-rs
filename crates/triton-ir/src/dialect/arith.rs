@@ -295,3 +295,45 @@ pub fn cmpf(pred: CmpfPred, lhs: Value, rhs: Value) -> OpSpec {
         .with_result(result_ty)
         .with_attr("predicate", Attr::Int(pred.as_i64(), Type::I64))
 }
+
+// ── casts ───────────────────────────────────────────────────────────────
+//
+// Each cast op preserves shape (tensor stays a tensor, scalar stays scalar);
+// only the element type changes. The caller is responsible for passing the
+// correct full `target` type — the high-level `FuncBuilder::to_f32`/`to_i32`
+// helpers compute it from the input shape, so DSL users rarely call these
+// directly.
+
+/// `arith.sitofp` — signed integer → float (e.g. i32 → f32).
+pub fn sitofp(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.sitofp")
+        .with_operand(x)
+        .with_result(target)
+}
+
+/// `arith.fptosi` — float → signed integer (truncating, e.g. f32 → i32).
+pub fn fptosi(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.fptosi")
+        .with_operand(x)
+        .with_result(target)
+}
+
+/// `arith.extf` — widen a float (f16/bf16 → f32, f32 → f64).
+pub fn extf(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.extf").with_operand(x).with_result(target)
+}
+
+/// `arith.truncf` — narrow a float (f32 → f16/bf16, f64 → f32).
+pub fn truncf(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.truncf").with_operand(x).with_result(target)
+}
+
+/// `arith.extsi` — sign-extend a smaller integer to a wider one (i32 → i64).
+pub fn extsi(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.extsi").with_operand(x).with_result(target)
+}
+
+/// `arith.trunci` — narrow a wider integer to a smaller one (i64 → i32).
+pub fn trunci(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.trunci").with_operand(x).with_result(target)
+}
