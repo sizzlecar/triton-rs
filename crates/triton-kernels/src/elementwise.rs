@@ -98,6 +98,44 @@ pub fn fused_silu_mul_f32<const BLOCK: usize>(
     store(out + off, silu_g * u, mask);
 }
 
+/// Same as [`fused_silu_mul_f32`] but for the **interleaved** memory layout
+/// where `gate` and `up` are concatenated into one buffer:
+/// `gate_up` is `[batch * 2 * inter]`. For each output element
+/// `out[b, i]` (flat index `b * inter + i`):
+///   `g = gate_up[b * 2 * inter + i]`
+///   `u = gate_up[b * 2 * inter + inter + i]`
+///   `out[b, i] = silu(g) * u`
+///
+/// Used by ferrum's expert-parallel MLP where the GEMM emits gate/up
+/// pre-interleaved per row, saving a split kernel before the activation.
+#[triton_kernel]
+pub fn fused_silu_mul_interleaved_f32<const BLOCK: usize>(
+    gate_up: Ptr<f32>,
+    out: Ptr<f32>,
+    inter: i32,
+    total: i32,
+) {
+    let pid = program_id(0);
+    let cols = make_range(0, BLOCK as i32);
+    let idx = pid * (BLOCK as i32) + cols;
+    let mask = idx < total;
+
+    // (b, i) = (idx / inter, idx % inter); recover the per-row stride.
+    let b = idx / inter;
+    let i = idx % inter;
+    let row_base = b * (2 * inter);
+
+    let gate_off = row_base + i;
+    let up_off = row_base + inter + i;
+    let g = load(gate_up + gate_off, mask);
+    let u = load(gate_up + up_off, mask);
+
+    let neg_g = g * -1.0_f32;
+    let denom = exp(neg_g) + 1.0_f32;
+    let silu_g = g / denom;
+    store(out + idx, silu_g * u, mask);
+}
+
 // ── biased linear post-processing ──
 
 /// Broadcast bias add: `data[r, c] += bias[c]`. One block per row,

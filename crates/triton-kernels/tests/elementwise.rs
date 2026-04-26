@@ -56,6 +56,21 @@ fn fused_silu_mul_uses_exp_div_mul() {
 }
 
 #[test]
+fn fused_silu_mul_interleaved_decodes_b_and_i_indices() {
+    let text = fused_silu_mul_interleaved_f32::<1024>::mlir();
+    assert!(text.contains("tt.func @fused_silu_mul_interleaved_f32("));
+    // (b, i) decomposition needs divsi + remsi against `inter`.
+    assert!(text.contains("\"arith.divsi\""), "missing divsi for b decode:\n{text}");
+    assert!(text.contains("\"arith.remsi\""), "missing remsi for i decode:\n{text}");
+    // 2 loads (gate, up from same buffer) + 1 store.
+    assert_eq!(text.matches("\"tt.load\"").count(), 2);
+    assert_eq!(text.matches("\"tt.store\"").count(), 1);
+    // Same silu math as fused_silu_mul_f32.
+    assert!(text.contains("\"math.exp\""));
+    assert!(text.contains("\"arith.divf\""));
+}
+
+#[test]
 fn add_bias_two_ptrs_two_i32_args() {
     let text = add_bias_f32::<1024>::mlir();
     assert!(text.contains("tt.func @add_bias_f32("));

@@ -44,8 +44,8 @@ pub mod reduction;
 pub mod prelude {
     pub use crate::cache::kv_cache_append_f32;
     pub use crate::elementwise::{
-        add_bias_f32, fused_silu_mul_f32, gelu_f32, residual_add_f32, residual_add_inplace_f32,
-        vec_add_f32,
+        add_bias_f32, fused_silu_mul_f32, fused_silu_mul_interleaved_f32, gelu_f32,
+        residual_add_f32, residual_add_inplace_f32, vec_add_f32,
     };
     pub use crate::embedding::embedding_lookup_f32;
     pub use crate::norms::{fused_add_rms_norm_f32, layer_norm_f32, rms_norm_f32};
