@@ -58,11 +58,18 @@
 #include "NVGPUToLLVM/NVGPUToLLVMPass.h"
 #include "TritonNVIDIAGPUToLLVM/Passes.h"
 
+#include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
@@ -224,6 +231,64 @@ static void build_llir_pipeline(
     pm.addPass(createLLVMDIScopePass());
 }
 
+// Link libdevice.10.bc into the module so calls to __nv_rsqrtf etc.
+// resolve. Same pattern as Python's `link_extern_libs` (NV side).
+// Returns empty error string on success.
+static std::string link_libdevice(llvm::Module& dst, const std::string& path) {
+    llvm::SMDiagnostic err;
+    std::unique_ptr<llvm::Module> libMod =
+        llvm::parseIRFile(path, err, dst.getContext());
+    if (!libMod) {
+        return "parseIRFile(libdevice) failed: " + err.getMessage().str();
+    }
+    libMod->setTargetTriple(dst.getTargetTriple());
+    libMod->setDataLayout(dst.getDataLayout());
+    llvm::Linker linker(dst);
+    if (linker.linkInModule(std::move(libMod),
+                            llvm::Linker::Flags::LinkOnlyNeeded)) {
+        return "Linker::linkInModule(libdevice) failed";
+    }
+    return "";
+}
+
+// Run LLVM's new-PM optimization pipeline at O3 with NVPTX target info,
+// matching what Python's `optimize_module(mod, OptimizationLevel::O3, ...)`
+// does. This closes the bench gap vs the Python compile path: vec_add /
+// silu_mul / residual_add were ~25% slower without it.
+static void optimize_module_O3(llvm::Module& mod, llvm::TargetMachine& tm) {
+    using namespace llvm;
+    LoopAnalysisManager lam;
+    FunctionAnalysisManager fam;
+    CGSCCAnalysisManager cgam;
+    ModuleAnalysisManager mam;
+
+    PipelineTuningOptions tune;
+    tune.LoopUnrolling = true;
+    tune.LoopVectorization = true;
+    tune.SLPVectorization = true;
+
+    PassBuilder pb(&tm, tune);
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+    mpm.run(mod, mam);
+}
+
+// Set the "nvvm-reflect-ftz" function attribute on every defined function
+// — this enables the fast-math-flags-aware paths in libdevice (rsqrt etc).
+// Matches Triton's `set_nvvm_reflect_ftz`.
+static void set_nvvm_reflect_ftz(llvm::Module& mod) {
+    for (auto& f : mod) {
+        if (!f.isDeclaration()) {
+            f.addFnAttr("nvvm-reflect-ftz", "1");
+        }
+    }
+}
+
 // ── PTX codegen via NVPTXTargetMachine ───────────────────────────
 static std::string llvm_to_ptx(llvm::Module& mod, int capability) {
     std::string triple = "nvptx64-nvidia-cuda";
@@ -365,6 +430,32 @@ TritonResult* triton_compile_mlir(
         llvm::LLVMContext llvm_ctx;
         auto llvm_mod = mlir::translateModuleToLLVMIR(*module, llvm_ctx);
         if (!llvm_mod) return make_error("translateModuleToLLVMIR failed");
+
+        // 4a. Build a NVPTXTargetMachine for datalayout + optimizer.
+        std::string triple = "nvptx64-nvidia-cuda";
+        std::string proc = (capability == 90) ? "sm_90a" : (std::string("sm_") + std::to_string(capability));
+        std::string features = "+ptx" + std::to_string(default_ptx_version(capability));
+        std::string err;
+        auto* nvtarget = llvm::TargetRegistry::lookupTarget(triple, err);
+        if (!nvtarget) return make_error("nvptx target lookup: " + err);
+        std::unique_ptr<llvm::TargetMachine> tm{nvtarget->createTargetMachine(
+            triple, proc, features, llvm::TargetOptions{},
+            std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_), std::nullopt,
+            llvm::CodeGenOptLevel::Aggressive)};
+        if (!tm) return make_error("createTargetMachine failed");
+        llvm_mod->setDataLayout(tm->createDataLayout());
+        llvm_mod->setTargetTriple(triple);
+
+        // 4b. Link libdevice (resolves __nv_rsqrtf etc.).
+        const char* libdevice_env = std::getenv("TRITON_LIBDEVICE_PATH");
+        std::string libdevice = libdevice_env ? libdevice_env :
+            "crates/triton-sys/vendor/triton/third_party/nvidia/backend/lib/libdevice.10.bc";
+        std::string link_err = link_libdevice(*llvm_mod, libdevice);
+        if (!link_err.empty()) return make_error(link_err);
+
+        // 4c. set ftz, then optimize at O3 (closes ~25% perf gap).
+        set_nvvm_reflect_ftz(*llvm_mod);
+        optimize_module_O3(*llvm_mod, *tm);
 
         // 5. llvm::Module → PTX text.
         std::string ptx = llvm_to_ptx(*llvm_mod, capability);
