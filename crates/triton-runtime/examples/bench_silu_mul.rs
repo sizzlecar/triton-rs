@@ -56,6 +56,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let module_name: &'static str = Box::leak(format!("bench_silu_{}", sub).into_boxed_str());
         let compiled_via = meta["compiled_via"].as_str().unwrap_or("triton_mlir").to_string();
+        let needs_scratch = compiled_via != "nvcc";
+        let global_scratch_size = meta["global_scratch_size"].as_u64().unwrap_or(0) as usize;
+        let profile_scratch_size = meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
+        let scratch: cudarc::driver::CudaSlice<u8> =
+            dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        let profile_scratch: cudarc::driver::CudaSlice<u8> =
+            dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
 
         let cfg = match compiled_via.as_str() {
             "nvcc" => LaunchConfig {
@@ -75,13 +82,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let func = dev.get_func(module_name, kernel_name).ok_or("kernel not found")?;
 
         for _ in 0..WARMUP {
-            unsafe { func.clone().launch(cfg, (&dev_gate, &dev_up, &mut dev_out, n_arg))?; }
+            unsafe {
+                if needs_scratch {
+                    func.clone().launch(cfg, (&dev_gate, &dev_up, &mut dev_out, n_arg, &scratch, &profile_scratch))?;
+                } else {
+                    func.clone().launch(cfg, (&dev_gate, &dev_up, &mut dev_out, n_arg))?;
+                }
+            }
         }
         dev.synchronize()?;
 
         let t0 = Instant::now();
         for _ in 0..ITERS {
-            unsafe { func.clone().launch(cfg, (&dev_gate, &dev_up, &mut dev_out, n_arg))?; }
+            unsafe {
+                if needs_scratch {
+                    func.clone().launch(cfg, (&dev_gate, &dev_up, &mut dev_out, n_arg, &scratch, &profile_scratch))?;
+                } else {
+                    func.clone().launch(cfg, (&dev_gate, &dev_up, &mut dev_out, n_arg))?;
+                }
+            }
         }
         dev.synchronize()?;
         let elapsed = t0.elapsed().as_secs_f64();

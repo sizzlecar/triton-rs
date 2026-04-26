@@ -77,6 +77,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_str()
             .unwrap_or("triton_mlir")
             .to_string();
+        let global_scratch_size = meta["global_scratch_size"].as_u64().unwrap_or(0) as usize;
+        let profile_scratch_size = meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
+        let scratch: cudarc::driver::CudaSlice<u8> =
+            dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        let profile_scratch: cudarc::driver::CudaSlice<u8> =
+            dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
 
         let cfg = match compiled_via.as_str() {
             "nvcc" => LaunchConfig {
@@ -103,7 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if compiled_via == "nvcc" {
                     func.clone().launch(cfg, (&dev_in, &dev_w, &mut dev_out, row_size, eps))?
                 } else {
-                    func.clone().launch(cfg, (&dev_in, &dev_w, &mut dev_out, row_size, inv_n, eps))?
+                    // v3.6 — append global_scratch + profile_scratch to user args.
+                    func.clone().launch(cfg, (&dev_in, &dev_w, &mut dev_out, row_size, inv_n, eps, &scratch, &profile_scratch))?
                 }
             };
         }

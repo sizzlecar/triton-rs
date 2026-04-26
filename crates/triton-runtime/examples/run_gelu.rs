@@ -26,6 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module_name: &'static str = "triton_kernel";
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
+    // v3.6 implicit scratch args — see run_vec_add.rs.
+    let global_scratch_size =
+        meta["global_scratch_size"].as_u64().unwrap_or(0) as usize;
+    let profile_scratch_size =
+        meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
 
     const BLOCK: u32 = 1024;
     const N: usize = 4096;
@@ -44,6 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
 
     let grid_x = ((N as u32) + BLOCK - 1) / BLOCK;
+    let scratch: cudarc::driver::CudaSlice<u8> =
+        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+    let profile_scratch: cudarc::driver::CudaSlice<u8> =
+        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (num_warps * 32, 1, 1),
@@ -53,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_arg: i32 = N as i32;
     unsafe {
         // 2-pointer + i32 calling convention.
-        func.launch(cfg, (&dev_x, &mut dev_out, n_arg))?;
+        func.launch(cfg, (&dev_x, &mut dev_out, n_arg, &scratch, &profile_scratch))?;
     }
     dev.synchronize()?;
 

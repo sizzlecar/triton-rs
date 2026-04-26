@@ -13,6 +13,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module_name: &'static str = "triton_kernel";
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
+    // v3.6 implicit scratch args — see run_vec_add.rs.
+    let global_scratch_size =
+        meta["global_scratch_size"].as_u64().unwrap_or(0) as usize;
+    let profile_scratch_size =
+        meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
 
     const ROWS: usize = 16;
     const DIM: usize = 768;
@@ -33,6 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev_b = dev.htod_copy(host_b.clone())?;
     let mut dev_o: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(ROWS * DIM)?;
 
+    let scratch: cudarc::driver::CudaSlice<u8> =
+        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+    let profile_scratch: cudarc::driver::CudaSlice<u8> =
+        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
     let cfg = LaunchConfig {
         grid_dim: (ROWS as u32, 1, 1),
         block_dim: (num_warps * 32, 1, 1),
@@ -41,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dim: i32 = DIM as i32;
     let inv_n: f32 = 1.0 / (DIM as f32);
     let eps: f32 = EPS;
-    unsafe { func.launch(cfg, (&dev_x, &dev_g, &dev_b, &mut dev_o, dim, inv_n, eps))?; }
+    unsafe { func.launch(cfg, (&dev_x, &dev_g, &dev_b, &mut dev_o, dim, inv_n, eps, &scratch, &profile_scratch))?; }
     dev.synchronize()?;
     let out = dev.dtoh_sync_copy(&dev_o)?;
 
