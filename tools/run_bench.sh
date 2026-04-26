@@ -19,10 +19,15 @@ BENCH=/tmp/triton_rs_bench/residual_add
 rm -rf "$BENCH"
 mkdir -p "$BENCH/dsl" "$BENCH/cu" "$BENCH/py"
 
-echo "== [1/3] triton-rs DSL  ->  MLIR  ->  Triton  ->  PTX =="
+echo "== [1/3] triton-rs DSL  ->  MLIR  ->  Triton (Rust shim)  ->  PTX =="
 cargo run --quiet --example ferrum_residual_add -p triton-dsl -- f32 \
     > "$BENCH/dsl/kernel.mlir"
-python3 tools/mlir_to_cubin.py "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
+if [[ "${USE_PYTHON_COMPILE:-0}" == "1" ]]; then
+    python3 tools/mlir_to_cubin.py "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
+else
+    cargo run --quiet --release -p triton-sys --features compile-triton \
+        --example compile_mlir -- "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
+fi
 
 echo "== [2/3] ferrum hand-written .cu  ->  nvcc  ->  PTX =="
 # Use the in-tree fixture under tools/reference_cu/ so the bench works on

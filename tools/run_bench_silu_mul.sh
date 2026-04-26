@@ -15,9 +15,14 @@ BENCH=/tmp/triton_rs_bench/silu_mul
 rm -rf "$BENCH"
 mkdir -p "$BENCH/dsl" "$BENCH/cu" "$BENCH/py"
 
-echo "== [1/3] triton-rs DSL  ->  MLIR  ->  Triton  ->  PTX =="
+echo "== [1/3] triton-rs DSL  ->  MLIR  ->  Triton (Rust shim)  ->  PTX =="
 cargo run --quiet --example ferrum_fused_silu_mul -p triton-dsl > "$BENCH/dsl/kernel.mlir"
-python3 tools/mlir_to_cubin.py "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
+if [[ "${USE_PYTHON_COMPILE:-0}" == "1" ]]; then
+    python3 tools/mlir_to_cubin.py "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
+else
+    cargo run --quiet --release -p triton-sys --features compile-triton \
+        --example compile_mlir -- "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
+fi
 
 echo "== [2/3] ferrum hand-written .cu  ->  nvcc  ->  PTX =="
 KERNEL_NAME=fused_silu_mul_f32 bash tools/compile_cu.sh \

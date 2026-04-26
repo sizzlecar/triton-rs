@@ -1,7 +1,9 @@
 # triton-rs Architecture
 
-> Last updated: 2026-04-25
-> Status: Phase 0 — scaffolding
+> Last updated: 2026-04-26
+> Status: **Phase 1 done — zero-Python compile + runtime path verified end-to-end on RTX 5070 Ti** (max_err=0 on vec_add, sm_89). The C ABI shim (`crates/triton-sys/`) drives Triton's MLIR pass pipeline directly from C++; cubin loads via cudarc; no Python in build or runtime path. See `crates/triton-sys/SPIKE.md` for the orchestrator map.
+>
+> Pre-built LLVM tarball pinned at commit `86b69c31` (Triton v3.2.0). Bumping to v3.6.0 is the next milestone.
 
 ## 1. 项目愿景
 
