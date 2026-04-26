@@ -83,6 +83,19 @@ def main() -> int:
     with open(cubin_path, "wb") as f:
         f.write(cubin_bytes)
 
+    # Also dump the PTX text so cudarc 0.13 (which only ships `load_ptx`,
+    # no `load_cubin`) can pick the kernel up. cuModuleLoadData under the
+    # hood will JIT-compile this PTX to native at load time.
+    ptx_text = asm.get("ptx")
+    if ptx_text is not None:
+        ptx_path = os.path.join(args.output_dir, "kernel.ptx")
+        with open(ptx_path, "w") as f:
+            if isinstance(ptx_text, bytes):
+                f.write(ptx_text.decode("utf-8", errors="replace"))
+            else:
+                f.write(ptx_text)
+        print(f"# wrote {ptx_path} ({len(ptx_text)} chars)", file=sys.stderr)
+
     md = result.metadata
     # `metadata` is a dataclass / namedtuple; access common fields defensively
     # since attribute names have shifted across Triton versions.
