@@ -11,9 +11,9 @@ links = "triton_c"
 [features]
 # Default builds the Rust scaffolding only — no Triton C++ libs are compiled.
 # Enable `compile-triton` to actually invoke cmake on the vendored Triton source.
-# Phase 0 ships the skeleton without compiling Triton (which takes ~30 min cold).
+# Cold build is ~30 min; tarball download is ~600 MB (Triton's pre-built LLVM).
 default = []
-compile-triton = []
+compile-triton = ["dep:bindgen", "dep:cc", "dep:cmake"]
 
 [dependencies]
 thiserror.workspace = true
