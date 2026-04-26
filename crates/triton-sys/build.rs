@@ -156,6 +156,25 @@ mod compile_triton {
     /// in v3.2.0). The list comes from inspecting Triton's own
     /// `add_triton_library` calls; verified by `cmake --build . --target help`.
     fn build_triton(vendor_dir: &PathBuf, llvm_root: &PathBuf, out_dir: &PathBuf) -> PathBuf {
+        // TableGen targets must run BEFORE the lib targets — they
+        // produce *.h.inc files that the lib sources `#include`.
+        // cmake doesn't (always) wire these as transitive deps for
+        // OBJECT libraries, so we build them explicitly first.
+        const TBLGEN_TARGETS: &[&str] = &[
+            "TritonCombineIncGen",
+            "TritonConversionPassIncGen",
+            "TritonGPUAttrDefsIncGen",
+            "TritonGPUConversionPassIncGen",
+            "TritonGPUTableGen",
+            "TritonGPUTransformsIncGen",
+            "TritonNvidiaGPUAttrDefsIncGen",
+            "TritonNVIDIAGPUConversionPassIncGen",
+            "NVGPUAttrDefsIncGen",
+            "NVGPUConversionPassIncGen",
+            "NVGPUTableGen",
+            "LLVMIRIncGen",
+        ];
+
         const LIB_TARGETS: &[&str] = &[
             "TritonIR",
             "TritonAnalysis",
@@ -196,7 +215,7 @@ mod compile_triton {
         };
 
         let mut dst = PathBuf::new();
-        for t in LIB_TARGETS {
+        for t in TBLGEN_TARGETS.iter().chain(LIB_TARGETS.iter()) {
             eprintln!("triton-sys: building cmake target `{}`", t);
             dst = mk_cfg().build_target(t).build();
         }
