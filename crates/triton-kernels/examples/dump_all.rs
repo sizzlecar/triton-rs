@@ -59,9 +59,12 @@ fn main() {
         "flash_decode_attn_phase2_f32"      => flash_decode_attn_phase2_f32::<128, 32>::mlir(),
         "batched_flash_decode_attn_phase1_f32"
                                             => batched_flash_decode_attn_phase1_f32::<128, 32>::mlir(),
-        // flash_attn_full is dtype-generic; we dump both instantiations.
+        // flash_attn_full IS dtype-generic in source, but only f32
+        // currently round-trips through Triton — the f16 path multiplies
+        // the f16 score tensor by the f32 `scale` parameter, which the
+        // DSL can't yet auto-cast (needs an `as::<T>()` helper). f16
+        // attention is tracked as a follow-up.
         "flash_attn_full_f32"               => flash_attn_full::<f32, 128, 1, 32>::mlir(),
-        "flash_attn_full_f16"               => flash_attn_full::<f16, 128, 1, 32>::mlir(),
     ];
 
     match target {
