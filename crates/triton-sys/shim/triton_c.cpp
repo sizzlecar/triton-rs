@@ -243,7 +243,11 @@ static void build_llir_pipeline(
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
     pm.addPass(createSymbolDCEPass());
-    pm.addPass(createLLVMDIScope());
+    // Skip createLLVMDIScope() — v3.6/LLVM21 NVPTX backend emits full
+    // DWARF .debug_info / .debug_macinfo sections that crash cudarc
+    // 0.13's load_ptx (CUDA driver PTX parser segfaults). Phase-2: pass
+    // cubin to cudarc instead of PTX text. Source-line info via the
+    // `-lineinfo` ptxas flag is preserved.
 }
 
 // Link libdevice.10.bc into the module so calls to __nv_rsqrtf etc.
