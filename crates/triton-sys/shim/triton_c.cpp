@@ -237,6 +237,13 @@ static void build_llir_pipeline(
     pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createConvertIndexToLLVMPass());
     pm.addPass(triton::gpu::createAllocateSharedMemory());
+    // v3.6: GlobalScratchAllocationPass populates the
+    // `ttg.global_scratch_memory_size` / `..._alignment` module attrs.
+    // The lowering pass below adds two extra implicit kernel args
+    // (global_scratch + profile_scratch) regardless; without this pass
+    // the module attrs are absent and the launcher can't tell what
+    // size to allocate. Must run before createConvertTritonGPUToLLVMPass.
+    pm.addPass(triton::gpu::createTritonGPUGlobalScratchAllocationPass());
     pm.addPass(triton::createConvertTritonGPUToLLVMPass(capability, ptx_version));
     pm.addPass(triton::createConvertNVGPUToLLVM());
     pm.addPass(createArithToLLVMConversionPass());
@@ -508,6 +515,21 @@ TritonResult* triton_compile_mlir(
                 "triton_gpu.shared")) {
             shared_mem = attr.getInt();
         }
+        // v3.6 implicit kernel args: scratch buffers the launcher must
+        // allocate + pass at the end of the user-arg list. Sizes/alignments
+        // are populated by createTritonGPUGlobalScratchAllocationPass.
+        // Profile scratch isn't allocated in our pipeline (we don't run
+        // the consan / profile-scratch pass), so default size=0 align=1.
+        int64_t global_scratch_size = 0;
+        if (auto attr = module->getOperation()->getAttrOfType<mlir::IntegerAttr>(
+                "ttg.global_scratch_memory_size")) {
+            global_scratch_size = attr.getInt();
+        }
+        int64_t global_scratch_align = 1;
+        if (auto attr = module->getOperation()->getAttrOfType<mlir::IntegerAttr>(
+                "ttg.global_scratch_memory_alignment")) {
+            global_scratch_align = attr.getInt();
+        }
         std::string meta = "{";
         meta += "\"name\":\"" + name + "\",";
         meta += "\"num_warps\":" + std::to_string(opts->num_warps) + ",";
@@ -515,6 +537,10 @@ TritonResult* triton_compile_mlir(
         meta += "\"num_ctas\":" + std::to_string(opts->num_ctas) + ",";
         meta += "\"shared_mem\":" + std::to_string(shared_mem) + ",";
         meta += "\"target_arch\":\"" + std::string(opts->target_arch) + "\",";
+        meta += "\"global_scratch_size\":" + std::to_string(global_scratch_size) + ",";
+        meta += "\"global_scratch_align\":" + std::to_string(global_scratch_align) + ",";
+        meta += "\"profile_scratch_size\":0,";
+        meta += "\"profile_scratch_align\":1,";
         // Cluster dims live as a module attribute in v3.6 (set by
         // PlanCTAPass) — for now hardcode (1,1,1) which is the default
         // for non-Hopper. Phase-2: extract via mod->getAttr("ttg.cluster-dims").
