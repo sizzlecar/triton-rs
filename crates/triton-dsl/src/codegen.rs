@@ -860,7 +860,11 @@ fn op_spec_for(
             CallKind::Value,
             quote! { ::triton_ir::dialect::tt::abs(#(#args),*) },
         ),
-        "exp" | "exp2" | "log" | "log2" | "sqrt" | "sin" | "cos" | "abs" => {
+        "rsqrt" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::rsqrt(#(#args),*) },
+        ),
+        "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "sin" | "cos" | "abs" => {
             return Err(arity_err("1"));
         }
 

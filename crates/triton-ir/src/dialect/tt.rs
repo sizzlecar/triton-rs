@@ -204,46 +204,51 @@ pub fn reduce_return(value: Value) -> OpSpec {
     OpSpec::new("tt.reduce.return").with_operand(value)
 }
 
-// ── element-wise math intrinsics (Triton dialect) ───────────────────────
+// ── element-wise math intrinsics (MLIR `math` dialect) ──────────────────
 //
-// All of these are 1-input → 1-output, preserve shape and element type.
-// Triton lowers them to the appropriate libdevice / PTX special-function
-// instructions at codegen. Element type must be one of the float kinds.
+// Triton 3.x lowers `tl.exp` / `tl.sqrt` / etc. to MLIR's standard
+// `math` dialect (math.exp, math.sqrt, ...) — not `tt.*`. Triton's
+// own dialect doesn't carry these ops. All preserve shape and element
+// type and must be applied to floats.
 
 fn unary_elementwise(name: &'static str, x: Value) -> OpSpec {
     let ty = x.ty().clone();
     OpSpec::new(name).with_operand(x).with_result(ty)
 }
 
-/// `tt.exp` — natural exponential, element-wise.
+/// `math.exp` — natural exponential, element-wise.
 pub fn exp(x: Value) -> OpSpec {
-    unary_elementwise("tt.exp", x)
+    unary_elementwise("math.exp", x)
 }
-/// `tt.exp2` — base-2 exponential, element-wise.
+/// `math.exp2` — base-2 exponential, element-wise.
 pub fn exp2(x: Value) -> OpSpec {
-    unary_elementwise("tt.exp2", x)
+    unary_elementwise("math.exp2", x)
 }
-/// `tt.log` — natural logarithm, element-wise.
+/// `math.log` — natural logarithm, element-wise.
 pub fn log(x: Value) -> OpSpec {
-    unary_elementwise("tt.log", x)
+    unary_elementwise("math.log", x)
 }
-/// `tt.log2` — base-2 logarithm, element-wise.
+/// `math.log2` — base-2 logarithm, element-wise.
 pub fn log2(x: Value) -> OpSpec {
-    unary_elementwise("tt.log2", x)
+    unary_elementwise("math.log2", x)
 }
-/// `tt.sqrt` — square root, element-wise.
+/// `math.sqrt` — square root, element-wise.
 pub fn sqrt(x: Value) -> OpSpec {
-    unary_elementwise("tt.sqrt", x)
+    unary_elementwise("math.sqrt", x)
 }
-/// `tt.sin` — sine, element-wise.
+/// `math.rsqrt` — reciprocal square root, element-wise.
+pub fn rsqrt(x: Value) -> OpSpec {
+    unary_elementwise("math.rsqrt", x)
+}
+/// `math.sin` — sine, element-wise.
 pub fn sin(x: Value) -> OpSpec {
-    unary_elementwise("tt.sin", x)
+    unary_elementwise("math.sin", x)
 }
-/// `tt.cos` — cosine, element-wise.
+/// `math.cos` — cosine, element-wise.
 pub fn cos(x: Value) -> OpSpec {
-    unary_elementwise("tt.cos", x)
+    unary_elementwise("math.cos", x)
 }
-/// `tt.abs` — absolute value, element-wise. Works on int and float.
+/// `math.absf` — absolute value (float), element-wise.
 pub fn abs(x: Value) -> OpSpec {
-    unary_elementwise("tt.abs", x)
+    unary_elementwise("math.absf", x)
 }
