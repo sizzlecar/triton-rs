@@ -192,35 +192,52 @@ mod compile_triton {
             "TritonNVIDIAGPUToLLVM",
         ];
 
-        // cmake-rs's `build_target` accepts one target per `build()` call,
-        // and its default of "install" tries to build everything (including
-        // bin/ tools that fail due to AMD-backend headers being absent in
-        // NVIDIA-only configs). Loop over the libs, building each in turn —
-        // the configure step is cached, so only the per-target compile cost
-        // is paid once. cmake parallelism inside each call still uses all
-        // cores via CMAKE_BUILD_PARALLEL_LEVEL.
-        let mk_cfg = || {
-            let mut cfg = cmake::Config::new(vendor_dir);
-            cfg.define("TRITON_BUILD_TUTORIALS", "OFF")
-                .define("TRITON_BUILD_PYTHON_MODULE", "OFF")
-                .define("TRITON_BUILD_PROTON", "OFF")
-                .define("TRITON_BUILD_UT", "OFF")
-                .define("TRITON_CODEGEN_BACKENDS", "nvidia")
-                .define("CMAKE_BUILD_TYPE", "Release")
-                .define("LLVM_LIBRARY_DIR", llvm_root.join("lib"))
-                .define("LLVM_INCLUDE_DIRS", llvm_root.join("include"))
-                .define("MLIR_DIR", llvm_root.join("lib/cmake/mlir"))
-                .out_dir(out_dir.join("triton-build"));
-            cfg
-        };
+        // Strategy (v3.6.0+): ONE cmake configure + ONE multi-target build.
+        // The previous iterated cmake-rs `build_target` approach re-ran
+        // configure on each invocation; with v3.6's much-expanded test
+        // target tree, repeated configure caused cmake to recurse on
+        // `check-triton-lit-tests` deps, generating paths like
+        // `check-triton-lit-tests-cmakefiles-check-triton-lit-tests-...`
+        // that overflow the OS file-name limit. Driving cmake by hand
+        // sidesteps that.
+        let build_dir = out_dir.join("triton-build/build");
+        std::fs::create_dir_all(&build_dir).ok();
 
-        let mut dst = PathBuf::new();
-        for t in TBLGEN_TARGETS.iter().chain(LIB_TARGETS.iter()) {
-            eprintln!("triton-sys: building cmake target `{}`", t);
-            dst = mk_cfg().build_target(t).build();
+        // 1. configure once (cmake re-uses CMakeCache.txt across runs).
+        let mut configure = std::process::Command::new("cmake");
+        configure
+            .arg("-S").arg(vendor_dir)
+            .arg("-B").arg(&build_dir)
+            .arg("-DCMAKE_BUILD_TYPE=Release")
+            .arg("-DTRITON_BUILD_PYTHON_MODULE=OFF")
+            .arg("-DTRITON_BUILD_PROTON=OFF")
+            .arg("-DTRITON_BUILD_UT=OFF")
+            .arg("-DTRITON_BUILD_TUTORIALS=OFF")
+            .arg("-DTRITON_CODEGEN_BACKENDS=nvidia")
+            .arg(format!("-DLLVM_LIBRARY_DIR={}", llvm_root.join("lib").display()))
+            .arg(format!("-DLLVM_INCLUDE_DIRS={}", llvm_root.join("include").display()))
+            .arg(format!("-DMLIR_DIR={}", llvm_root.join("lib/cmake/mlir").display()));
+        let cfg_status = configure.status().expect("failed to spawn cmake (configure)");
+        if !cfg_status.success() {
+            panic!("cmake configure failed with status {:?}", cfg_status);
         }
-        eprintln!("triton-sys: cmake build root = {}", dst.display());
-        dst
+
+        // 2. build all required targets in one invocation. cmake supports
+        //    multiple `--target` flags on a single `--build` call (cmake 3.15+).
+        let mut build = std::process::Command::new("cmake");
+        build.arg("--build").arg(&build_dir).arg("--config").arg("Release");
+        for t in TBLGEN_TARGETS.iter().chain(LIB_TARGETS.iter()) {
+            build.arg("--target").arg(*t);
+        }
+        let build_status = build.status().expect("failed to spawn cmake (build)");
+        if !build_status.success() {
+            panic!("cmake --build failed with status {:?}", build_status);
+        }
+
+        // Return the parent of build/ to keep the include-path layout in
+        // `compile_shim` (it expects `triton-build/build/include`, etc.)
+        // consistent with the previous cmake-rs convention.
+        out_dir.join("triton-build")
     }
 
     /// Step 4 — compile our C++ shim. Phase 1C will fill in the
