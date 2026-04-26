@@ -63,11 +63,12 @@ Python @triton.jit          349.4       768.3      85.7%  32768×128
 | `decode_attention_hm_f32` | ✅ | 6864 | 81760 | Head-major KV cache (`[nkv, cap, hd]`) |
 | `batched_decode_attention_f32` | ✅ | 7336 | 83552 | Continuous batching (Z×Hq×D) |
 | `paged_decode_attention_f32` | ✅ | 7771 | 97888 | Block-table indirection (vLLM pattern) |
-| `flash_decode_attention` | 🚧 | — | — | Split-K + reduce phase (2 kernels) |
-| `batched_flash_decode_attention` | 🚧 | — | — | Batched + split-K |
-| `flash_attn_full` | 🚧 | — | — | Prefill, multi-token Q |
+| `flash_decode_attn_phase1_f32` | ✅ | 7447 | 83936 | Split-K phase 1 (per-split partial state) |
+| `flash_decode_attn_phase2_f32` | ✅ | 4254 | 42344 | Log-sum-exp combine across splits |
+| `batched_flash_decode_attn_phase1_f32` | ✅ | 8097 | 85216 | Batched + split-K (reuses phase 2) |
+| `flash_attn_full` | 🚧 | — | — | Prefill, multi-token Q (deferred — needs causal mask + multi-Q tile) |
 
-All 4 done variants ship via `triton_kernels::prelude::*` and compile end-to-end through the Rust shim. Online-softmax pattern uses `scf_for` with 3 iter_args (m_i, l_i, acc); Q·K via broadcast-mul-reduce instead of `tt.dot` (avoids the transposed-K load and works for HEAD_DIM ≤ 256). Paged variant adds a `block_table[logical]` gather load per KV tile — `tt.load(block_table_ptr + logical_blocks_tile)` works out of the box.
+All 6 done variants ship via `triton_kernels::prelude::*` and compile end-to-end through the Rust shim. Online-softmax pattern uses `scf_for` with 3 iter_args (m_i, l_i, acc); Q·K via broadcast-mul-reduce instead of `tt.dot` (avoids the transposed-K load and works for HEAD_DIM ≤ 256). Paged variant adds a `block_table[logical]` gather load per KV tile — `tt.load(block_table_ptr + logical_blocks_tile)` works out of the box.
 
 DSL extension added for these: 2D singleton-broadcast (`[m,1]+[1,n]→[m,n]` auto-emits `tt.broadcast` on each side; see `crates/triton-ir/src/module.rs::coerce_elemwise`).
 
