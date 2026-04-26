@@ -36,6 +36,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
@@ -82,6 +83,7 @@ TritonContext* triton_context_create(void) {
                     mlir::triton::gpu::TritonGPUDialect,
                     mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
                     mlir::triton::nvgpu::NVGPUDialect>();
+    mlir::registerBuiltinDialectTranslation(registry);
     mlir::registerLLVMDialectTranslation(registry);
     mlir::registerNVVMDialectTranslation(registry);
     ctx->mlirCtx.appendDialectRegistry(registry);
