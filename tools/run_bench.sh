@@ -25,10 +25,11 @@ cargo run --quiet --example ferrum_residual_add -p triton-dsl -- f32 \
 python3 tools/mlir_to_cubin.py "$BENCH/dsl/kernel.mlir" "$BENCH/dsl" --arch "$ARCH"
 
 echo "== [2/3] ferrum hand-written .cu  ->  nvcc  ->  PTX =="
-FERRUM_CU="${REPO_ROOT}/../ferrum-infer-rs/crates/ferrum-kernels/kernels/residual_add.cu"
+# Use the in-tree fixture under tools/reference_cu/ so the bench works on
+# any host without ferrum-infer-rs checked out alongside.
+FERRUM_CU="${FERRUM_CU:-${REPO_ROOT}/tools/reference_cu/residual_add.cu}"
 if [[ ! -f "$FERRUM_CU" ]]; then
-    echo "WARN: ferrum source not found at $FERRUM_CU" >&2
-    echo "       set FERRUM_CU env var to its actual path" >&2
+    echo "ERROR: ferrum reference .cu not found at $FERRUM_CU" >&2
     exit 2
 fi
 KERNEL_NAME=residual_add_f32 bash tools/compile_cu.sh "$FERRUM_CU" "$BENCH/cu" --arch "$ARCH"
