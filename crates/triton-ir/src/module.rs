@@ -408,11 +408,22 @@ impl<'m> FuncBuilder<'m> {
                 (a_splat, b)
             }
             (true, true) => {
-                let (sa, sb) = match (a.ty(), b.ty()) {
-                    (Type::Tensor { shape: sa, .. }, Type::Tensor { shape: sb, .. }) => {
-                        (sa.clone(), sb.clone())
-                    }
+                let (sa, sb, ea, eb) = match (a.ty(), b.ty()) {
+                    (
+                        Type::Tensor { shape: sa, elem: ea },
+                        Type::Tensor { shape: sb, elem: eb },
+                    ) => (sa.clone(), sb.clone(), (**ea).clone(), (**eb).clone()),
                     _ => unreachable!(),
+                };
+                // Dtype coercion: if elem types differ AND both are arithmetic,
+                // cast b to a's elem (left-operand-wins, deterministic). For
+                // pointer tensors or unsupported casts, leave as-is — the op
+                // verifier will catch a real mismatch.
+                let (a, b) = if ea != eb && is_arith_elem(&ea) && is_arith_elem(&eb) {
+                    let b_cast = self.cast_with_elem(b, ea.clone());
+                    (a, b_cast)
+                } else {
+                    (a, b)
                 };
                 if sa == sb {
                     return (a, b);
