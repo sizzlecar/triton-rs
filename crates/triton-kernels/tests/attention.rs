@@ -70,3 +70,21 @@ fn batched_decode_attention_emits_kernel_with_div_rem_for_batch_decompose() {
     assert!(text.contains("\"arith.remsi\""), "missing batch decompose:\n{text}");
     assert!(text.contains("\"scf.for\""));
 }
+
+#[test]
+fn paged_decode_attention_emits_block_table_gather() {
+    let text = paged_decode_attention_f32::<128, 32>::mlir();
+    assert!(text.contains("tt.func @paged_decode_attention_f32("));
+    // Address-translation needs divsi (logical = pos / block_size) + remsi
+    // (slot = pos % block_size).
+    assert!(text.contains("\"arith.divsi\""));
+    assert!(text.contains("\"arith.remsi\""));
+    // Gather load on block_table (i32 ptr) — distinct from the K/V loads
+    // (f32 ptr). Total loads ≥ 4 (Q + block_table + K + V).
+    assert!(text.matches("\"tt.load\"").count() >= 4,
+            "expected ≥4 loads (Q + block_table gather + K + V):\n{text}");
+    // i32 ptr in the func header (block_table arg).
+    let header = &text[..text.find(") {").unwrap()];
+    assert!(header.contains("!tt.ptr<i32>"),
+            "missing i32 ptr param for block_table:\n{header}");
+}

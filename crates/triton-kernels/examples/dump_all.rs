@@ -39,6 +39,7 @@ fn main() {
         "decode_attention_f32"              => decode_attention_f32::<128, 32>::mlir(),
         "decode_attention_hm_f32"           => decode_attention_hm_f32::<128, 32>::mlir(),
         "batched_decode_attention_f32"      => batched_decode_attention_f32::<128, 32>::mlir(),
+        "paged_decode_attention_f32"        => paged_decode_attention_f32::<128, 32>::mlir(),
     ];
 
     match target {

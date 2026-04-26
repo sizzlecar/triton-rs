@@ -309,3 +309,112 @@ pub fn batched_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize
     let out_off = q_row_base + dim_range;
     store(output + out_off, out_v, dim_mask);
 }
+
+/// **Paged** single-query decode attention with block-table indirection.
+///
+/// K/V live in a paged block pool instead of a contiguous tensor:
+///   `k_block_pool` shape `[max_blocks, block_size, num_kv_heads, head_dim]`
+///   `block_table[logical_block] = physical_block_id`
+///
+/// For each `kv_pos in [0, valid_kv_len)`:
+///   logical = kv_pos / block_size
+///   slot    = kv_pos % block_size
+///   physical = block_table[logical]
+///   addr = physical * (block_size * num_kv_heads * head_dim)
+///        + slot     * (num_kv_heads * head_dim)
+///        + kv_head  * head_dim
+///        + d
+///
+/// Compared to the contiguous variants this kernel does an extra gather
+/// load on `block_table` per KV tile. The gather is straightforward in
+/// Triton DSL: `tt.load(block_table + logical_blocks_tile)` produces a
+/// `tensor<BLOCK_KVxi32>` that we use as the per-position physical-block
+/// index in subsequent address arithmetic.
+///
+/// Used by ferrum's PagedAttention path. v0 still assumes
+/// `valid_kv_len % BLOCK_KV == 0` and `head_dim == HEAD_DIM`.
+#[triton_kernel]
+pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
+    q: Ptr<f32>,
+    k_block_pool: Ptr<f32>,
+    v_block_pool: Ptr<f32>,
+    block_table: Ptr<i32>,
+    output: Ptr<f32>,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    valid_kv_len: i32,
+    block_size: i32,
+    scale: f32,
+) {
+    let _ = num_q_heads;
+    let q_head = program_id(0);
+    let num_kv_groups = num_q_heads / num_kv_heads;
+    let kv_head = q_head / num_kv_groups;
+
+    let kv_stride = num_kv_heads * head_dim;
+    let block_stride = block_size * kv_stride;
+
+    let dim_range = make_range(0, HEAD_DIM as i32);
+    let dim_mask = dim_range < head_dim;
+    let q_off = q_head * head_dim + dim_range;
+    let q_v = load(q + q_off, dim_mask);
+
+    let m_init = const_f32(0.0_f32) - const_f32(1.0e30_f32);
+    let l_init = const_f32(0.0_f32);
+    let acc_init = q_v * 0.0_f32;
+
+    let kv_blocks = valid_kv_len / (BLOCK_KV as i32);
+
+    let (_, l_i, acc) = scf_for(
+        const_i32(0),
+        kv_blocks,
+        const_i32(1),
+        (m_init, l_init, acc_init),
+        |kb, (m_i, l_i, acc)| {
+            let pos_base = kb * (BLOCK_KV as i32);
+            let pos_range = make_range(0, BLOCK_KV as i32) + pos_base;
+
+            // Address-translation gather: for each pos, look up
+            // physical_block via block_table[pos / block_size]. The
+            // logical block can repeat within a tile when block_size
+            // is small — this still works (we just re-read the same
+            // physical_block id for adjacent slots).
+            let logical_blocks = pos_range / block_size; // [BLOCK_KV]
+            let slots = pos_range % block_size;          // [BLOCK_KV]
+            let physical_blocks = load(block_table + logical_blocks); // GATHER
+
+            // Per-position row base: physical * block_stride + slot * kv_stride + kv_head*head_dim
+            let row_base = physical_blocks * block_stride + slots * kv_stride + kv_head * head_dim;
+            let row_base_2d = expand_dims(row_base, 1);
+            let col_2d = expand_dims(dim_range, 0);
+            let kv_off_2d = row_base_2d + col_2d;
+
+            let k_block = load(k_block_pool + kv_off_2d);
+            let v_block = load(v_block_pool + kv_off_2d);
+
+            let q_2d = expand_dims(q_v, 0);
+            let qk = q_2d * k_block;
+            let scores_raw = reduce(qk, 1, |a, b| a + b);
+            let scores = scores_raw * scale;
+
+            let scores_max = reduce(scores, 0, |a, b| max(a, b));
+            let m_ij = max(m_i, scores_max);
+            let alpha = exp(m_i - m_ij);
+            let p = exp(scores - m_ij);
+            let l_ij = reduce(p, 0, |a, b| a + b);
+
+            let p_2d = expand_dims(p, 1);
+            let pv = p_2d * v_block;
+            let pv_sum = reduce(pv, 0, |a, b| a + b);
+
+            let new_acc = acc * alpha + pv_sum;
+            let new_l_i = l_i * alpha + l_ij;
+            (m_ij, new_l_i, new_acc)
+        },
+    );
+
+    let out_v = acc / l_i;
+    let out_off = q_head * head_dim + dim_range;
+    store(output + out_off, out_v, dim_mask);
+}
