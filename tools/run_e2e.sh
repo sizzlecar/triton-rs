@@ -47,8 +47,16 @@ else
 fi
 wc -l "$OUT/kernel.mlir"
 
-echo "== [2/3] compile MLIR -> PTX/cubin via Triton (Python) =="
-python3 tools/mlir_to_cubin.py "$OUT/kernel.mlir" "$OUT" --arch "$ARCH"
+echo "== [2/3] compile MLIR -> PTX/cubin via Triton (Rust shim, Python-free) =="
+# Use the Rust C ABI shim (Phase 1 done — no Python in the path).
+# Set USE_PYTHON_COMPILE=1 to fall back to tools/mlir_to_cubin.py for
+# A/B testing during the v3.6.0 bump or if the shim regresses.
+if [[ "${USE_PYTHON_COMPILE:-0}" == "1" ]]; then
+    python3 tools/mlir_to_cubin.py "$OUT/kernel.mlir" "$OUT" --arch "$ARCH"
+else
+    cargo run --quiet --release -p triton-sys --features compile-triton \
+        --example compile_mlir -- "$OUT/kernel.mlir" "$OUT" --arch "$ARCH"
+fi
 
 echo "== [3/3] launch on GPU via cudarc =="
 # Pick a runner that matches the kernel signature.

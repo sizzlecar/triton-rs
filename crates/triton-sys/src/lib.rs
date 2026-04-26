@@ -66,22 +66,29 @@ impl Default for CompileOptions {
     }
 }
 
-/// Successful compile output: cubin bytes + metadata JSON.
+/// Successful compile output: cubin bytes + PTX text + metadata JSON.
 pub struct Compiled {
     cubin: Vec<u8>,
+    ptx_text: String,
     metadata_json: String,
 }
 
 impl Compiled {
-    /// Cubin (CUDA binary) bytes — feed to `cuModuleLoadData` / cudarc's
-    /// `Ptx::from(...)` (after a PTX text round-trip if needed).
+    /// Cubin (CUDA binary) bytes — load via `cuModuleLoadData` /
+    /// equivalent. Empty when the backend is non-NVIDIA.
     pub fn cubin(&self) -> &[u8] {
         &self.cubin
     }
 
-    /// JSON-encoded kernel metadata (name, num_warps, shared_mem, ...).
-    /// Hand-formatted by the C shim for stability — parse with serde_json
-    /// in higher layers.
+    /// PTX text — emitted by LLVM's NVPTX backend before ptxas. Use
+    /// this with cudarc 0.13's `Ptx::from(...)` (which only accepts
+    /// PTX text, not raw cubin). Empty when backend is non-NVIDIA.
+    pub fn ptx_text(&self) -> &str {
+        &self.ptx_text
+    }
+
+    /// JSON-encoded kernel metadata (name, num_warps, shared_mem,
+    /// target_arch, cluster_dims, ...). Parse with serde_json upstream.
     pub fn metadata_json(&self) -> &str {
         &self.metadata_json
     }
@@ -172,9 +179,14 @@ impl Context {
         } else {
             unsafe { std::ffi::CStr::from_ptr(r.metadata_json).to_string_lossy().into_owned() }
         };
+        let ptx_text = if r.ptx_text.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(r.ptx_text).to_string_lossy().into_owned() }
+        };
 
         drop(result); // explicit free of the C-side TritonResult
-        Ok(Compiled { cubin, metadata_json })
+        Ok(Compiled { cubin, ptx_text, metadata_json })
     }
 }
 

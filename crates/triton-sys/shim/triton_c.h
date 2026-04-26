@@ -36,6 +36,12 @@ typedef struct TritonResult {
 
     /* UTF-8 error message, NULL on success. Owned by the result. */
     const char* error_message;
+
+    /* PTX text — emitted by the LLVM NVPTX backend before ptxas is invoked.
+     * Useful for cudarc 0.13's `Ptx::from(...)` which wants PTX text, not
+     * cubin. NULL on error or if the backend is not NVIDIA. Owned. Appended
+     * after error_message to keep the C ABI stable for older callers. */
+    const char* ptx_text;
 } TritonResult;
 
 /* Compile options. ABI-stable: never reorder, only append. */

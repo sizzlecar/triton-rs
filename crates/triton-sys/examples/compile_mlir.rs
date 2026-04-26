@@ -118,6 +118,15 @@ fn main() -> std::process::ExitCode {
     }
     eprintln!("# wrote {} ({} bytes)", cubin_path.display(), compiled.cubin().len());
 
+    if !compiled.ptx_text().is_empty() {
+        let ptx_path = output_dir.join("kernel.ptx");
+        if let Err(e) = std::fs::write(&ptx_path, compiled.ptx_text()) {
+            eprintln!("write {}: {e}", ptx_path.display());
+            return 2.into();
+        }
+        eprintln!("# wrote {} ({} chars)", ptx_path.display(), compiled.ptx_text().len());
+    }
+
     let meta_path = output_dir.join("kernel.json");
     if let Err(e) = std::fs::write(&meta_path, compiled.metadata_json()) {
         eprintln!("write {}: {e}", meta_path.display());

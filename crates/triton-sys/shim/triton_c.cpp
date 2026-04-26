@@ -119,6 +119,7 @@ static TritonResult* make_error(const std::string& msg) {
     r->binary_size = 0;
     r->metadata_json = nullptr;
     r->error_message = dup_cstr(msg);
+    r->ptx_text = nullptr;
     return r;
 }
 
@@ -126,6 +127,7 @@ void triton_result_destroy(TritonResult* result) {
     if (!result) return;
     std::free(reinterpret_cast<void*>(const_cast<char*>(result->error_message)));
     std::free(reinterpret_cast<void*>(const_cast<char*>(result->metadata_json)));
+    std::free(reinterpret_cast<void*>(const_cast<char*>(result->ptx_text)));
     std::free(result->binary_data);
     std::free(result);
 }
@@ -374,12 +376,19 @@ TritonResult* triton_compile_mlir(
 
         // 7. Build metadata JSON (hand-formatted, no JSON lib).
         std::string name = extract_kernel_name(ptx);
+        // shared_mem from the module's "triton_gpu.shared" int attr (set
+        // by createAllocateSharedMemoryPass during the LLIR pipeline).
+        int64_t shared_mem = 0;
+        if (auto attr = module->getOperation()->getAttrOfType<mlir::IntegerAttr>(
+                "triton_gpu.shared")) {
+            shared_mem = attr.getInt();
+        }
         std::string meta = "{";
         meta += "\"name\":\"" + name + "\",";
         meta += "\"num_warps\":" + std::to_string(opts->num_warps) + ",";
         meta += "\"num_stages\":" + std::to_string(opts->num_stages) + ",";
         meta += "\"num_ctas\":" + std::to_string(opts->num_ctas) + ",";
-        meta += "\"shared_mem\":0,";  // TODO: pull from module attr "triton_gpu.shared"
+        meta += "\"shared_mem\":" + std::to_string(shared_mem) + ",";
         meta += "\"target_arch\":\"" + std::string(opts->target_arch) + "\",";
         meta += "\"cluster_dims\":[" +
                 std::to_string(cluster_info.clusterDimX) + "," +
@@ -395,6 +404,7 @@ TritonResult* triton_compile_mlir(
         std::memcpy(r->binary_data, cubin.data(), cubin.size());
         r->metadata_json = dup_cstr(meta);
         r->error_message = nullptr;
+        r->ptx_text = dup_cstr(ptx);
         return r;
 
     } catch (const std::exception& e) {
