@@ -217,7 +217,7 @@ static void build_llir_pipeline(
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
     pm.addPass(createSymbolDCEPass());
-    pm.addPass(triton::createLLVMDIScopePass());
+    pm.addPass(createLLVMDIScopePass());
 }
 
 // ── PTX codegen via NVPTXTargetMachine ───────────────────────────
