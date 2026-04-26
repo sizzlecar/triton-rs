@@ -156,25 +156,7 @@ mod compile_triton {
     /// in v3.2.0). The list comes from inspecting Triton's own
     /// `add_triton_library` calls; verified by `cmake --build . --target help`.
     fn build_triton(vendor_dir: &PathBuf, llvm_root: &PathBuf, out_dir: &PathBuf) -> PathBuf {
-        // TableGen targets must run BEFORE the lib targets — they
-        // produce *.h.inc files that the lib sources `#include`.
-        // cmake doesn't (always) wire these as transitive deps for
-        // OBJECT libraries, so we build them explicitly first.
-        const TBLGEN_TARGETS: &[&str] = &[
-            "TritonCombineIncGen",
-            "TritonConversionPassIncGen",
-            "TritonGPUAttrDefsIncGen",
-            "TritonGPUConversionPassIncGen",
-            "TritonGPUTableGen",
-            "TritonGPUTransformsIncGen",
-            "TritonNvidiaGPUAttrDefsIncGen",
-            "TritonNVIDIAGPUConversionPassIncGen",
-            "NVGPUAttrDefsIncGen",
-            "NVGPUConversionPassIncGen",
-            "NVGPUTableGen",
-            "LLVMIRIncGen",
-        ];
-
+        // Lib targets we link against. (No bin/, no Proton, no Gluon.)
         const LIB_TARGETS: &[&str] = &[
             "TritonIR",
             "TritonAnalysis",
@@ -222,11 +204,42 @@ mod compile_triton {
             panic!("cmake configure failed with status {:?}", cfg_status);
         }
 
-        // 2. build all required targets in one invocation. cmake supports
-        //    multiple `--target` flags on a single `--build` call (cmake 3.15+).
+        // 2. discover all *IncGen / *TableGen targets dynamically, then
+        //    build (TableGen first, then libs) in one cmake invocation.
+        //    Doing this dynamically survives v3.2 → v3.6 → future bumps:
+        //    the v3.6 release added many new IncGens (TritonGPUCTAAttrIncGen,
+        //    TritonGPUOpInterfacesIncGen, NVHopperTransformsIncGen, ...)
+        //    that v3.2 didn't have.
+        let help = std::process::Command::new("cmake")
+            .arg("--build").arg(&build_dir).arg("--target").arg("help")
+            .output()
+            .expect("failed to query cmake --target help");
+        let help_text = String::from_utf8_lossy(&help.stdout);
+        let mut tblgen_targets: Vec<String> = help_text
+            .lines()
+            .filter_map(|l| l.strip_prefix("... "))
+            .filter(|t| {
+                (t.contains("IncGen") || t.contains("TableGen"))
+                    // Skip Proton / AMD / Gluon / NVWS — Hopper-only / non-NVIDIA paths.
+                    && !t.starts_with("Proton")
+                    && !t.starts_with("AMD")
+                    && !t.starts_with("Gluon")
+                    && !t.starts_with("NVWS")
+                    && !t.starts_with("NVHopper")
+                    && !t.starts_with("TritonInstrument")
+            })
+            .map(|t| t.to_string())
+            .collect();
+        tblgen_targets.sort();
+        tblgen_targets.dedup();
+        eprintln!("triton-sys: TableGen targets = {:?}", tblgen_targets);
+
         let mut build = std::process::Command::new("cmake");
         build.arg("--build").arg(&build_dir).arg("--config").arg("Release");
-        for t in TBLGEN_TARGETS.iter().chain(LIB_TARGETS.iter()) {
+        for t in tblgen_targets.iter() {
+            build.arg("--target").arg(t);
+        }
+        for t in LIB_TARGETS.iter() {
             build.arg("--target").arg(*t);
         }
         let build_status = build.status().expect("failed to spawn cmake (build)");
