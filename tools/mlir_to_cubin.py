@@ -43,7 +43,6 @@ def main() -> int:
     try:
         from triton.compiler import compile
         from triton.backends.compiler import GPUTarget
-        from triton.backends.nvidia.compiler import CUDAOptions
     except Exception as e:
         print(f"environment: cannot import triton compiler internals: {e}",
               file=sys.stderr)
@@ -69,11 +68,13 @@ def main() -> int:
         print(f"# copied {args.input} -> {ttir_path} for IRSource", file=sys.stderr)
 
     target = GPUTarget("cuda", args.arch, 32)
-    opts = CUDAOptions(
-        num_warps=args.num_warps,
-        num_stages=args.num_stages,
-        # Empty defaults for the rest; CUDAOptions handles the missing fields.
-    )
+    # compile() does `dict(options, **extra_options)` then hands it to the
+    # backend's parse_options to build a CUDAOptions internally — so pass
+    # a plain dict, not the dataclass.
+    opts = {
+        "num_warps": args.num_warps,
+        "num_stages": args.num_stages,
+    }
 
     print(f"# compiling {args.input} -> sm_{args.arch}", file=sys.stderr)
     try:
