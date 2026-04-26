@@ -252,3 +252,11 @@ pub fn cos(x: Value) -> OpSpec {
 pub fn abs(x: Value) -> OpSpec {
     unary_elementwise("math.absf", x)
 }
+/// `math.tanh` — hyperbolic tangent, element-wise.
+pub fn tanh(x: Value) -> OpSpec {
+    unary_elementwise("math.tanh", x)
+}
+/// `math.erf` — error function, element-wise.
+pub fn erf(x: Value) -> OpSpec {
+    unary_elementwise("math.erf", x)
+}

@@ -51,7 +51,16 @@ echo "== [2/3] compile MLIR -> PTX/cubin via Triton (Python) =="
 python3 tools/mlir_to_cubin.py "$OUT/kernel.mlir" "$OUT" --arch "$ARCH"
 
 echo "== [3/3] launch on GPU via cudarc =="
-cargo run --quiet --example run_vec_add -p triton-runtime --features cuda --release -- \
+# Pick a runner that matches the kernel signature.
+case "${RUNNER:-auto}" in
+    auto)
+        case "$EXAMPLE" in
+            ferrum_gelu) RUNNER=run_gelu ;;
+            *)           RUNNER=run_vec_add ;;
+        esac
+        ;;
+esac
+cargo run --quiet --example "$RUNNER" -p triton-runtime --features cuda --release -- \
     "$OUT/kernel.ptx" "$OUT/kernel.json" --op "$OP"
 
 echo "== DONE =="

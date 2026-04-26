@@ -864,7 +864,16 @@ fn op_spec_for(
             CallKind::Value,
             quote! { ::triton_ir::dialect::tt::rsqrt(#(#args),*) },
         ),
-        "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "sin" | "cos" | "abs" => {
+        "tanh" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::tanh(#(#args),*) },
+        ),
+        "erf" if n == 1 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::tt::erf(#(#args),*) },
+        ),
+        "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "sin" | "cos" | "abs"
+        | "tanh" | "erf" => {
             return Err(arity_err("1"));
         }
 
