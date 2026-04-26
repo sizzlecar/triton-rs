@@ -42,7 +42,6 @@ def main() -> int:
 
     try:
         from triton.compiler import compile
-        from triton.compiler.compiler import IRSource
         from triton.backends.compiler import GPUTarget
         from triton.backends.nvidia.compiler import CUDAOptions
     except Exception as e:
@@ -69,7 +68,6 @@ def main() -> int:
         input_path = ttir_path
         print(f"# copied {args.input} -> {ttir_path} for IRSource", file=sys.stderr)
 
-    src = IRSource(input_path)
     target = GPUTarget("cuda", args.arch, 32)
     opts = CUDAOptions(
         num_warps=args.num_warps,
@@ -79,7 +77,11 @@ def main() -> int:
 
     print(f"# compiling {args.input} -> sm_{args.arch}", file=sys.stderr)
     try:
-        result = compile(src, target=target, options=opts)
+        # `compile()` expects either ASTSource (Python kernel) or a file
+        # path string; if given a string, it constructs the IRSource
+        # itself. Passing our own IRSource instance is rejected by an
+        # internal assertion in 3.2.0.
+        result = compile(input_path, target=target, options=opts)
     except Exception as e:
         print(f"triton compile failed: {type(e).__name__}: {e}",
               file=sys.stderr)
