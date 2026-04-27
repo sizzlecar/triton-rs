@@ -62,11 +62,7 @@ fn build_if_yields_value() -> Module {
     let then_v = f.op_one(arith::constant_i32(1));
     let else_v = f.op_one(arith::constant_i32(2));
 
-    let results = f.if_then_else_with(
-        cond,
-        |_fb| vec![then_v.clone()],
-        |_fb| vec![else_v.clone()],
-    );
+    let results = f.if_then_else_with(cond, |_fb| vec![then_v.clone()], |_fb| vec![else_v.clone()]);
     let v = results.into_iter().next().unwrap();
 
     f.op_void(tt::store(out_ptr, v, None));
