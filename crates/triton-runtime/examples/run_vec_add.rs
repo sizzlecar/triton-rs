@@ -44,12 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load the metadata so we know the kernel name and launch shape.
     let meta_text = std::fs::read_to_string(&meta_path)?;
     let meta: serde_json::Value = serde_json::from_str(&meta_text)?;
-    let kernel_name = meta["name"].as_str().ok_or("metadata.name missing")?;
-    // cudarc 0.13's load_ptx wants &[&'static str] for function names.
-    // Leak the string so its lifetime extends through the program.
-    let kernel_name: &'static str =
-        Box::leak(kernel_name.to_string().into_boxed_str());
-    let module_name: &'static str = "triton_kernel";
+    let kernel_name = meta["name"].as_str().ok_or("metadata.name missing")?.to_string();
 
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
@@ -69,34 +64,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 4096; // total elements; gives a 4-block grid
 
     // 3. Initialise CUDA + load the PTX.
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
 
-    let dev = CudaDevice::new(0)?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
 
     let ptx_text = std::fs::read_to_string(&ptx_path)?;
     let ptx = Ptx::from(ptx_text);
-    dev.load_ptx(ptx, module_name, &[kernel_name])?;
-    let func = dev
-        .get_func(module_name, kernel_name)
-        .ok_or_else(|| format!("kernel `{}` not found in PTX module", kernel_name))?;
+    let module = ctx.load_module(ptx)?;
+    let func = module.load_function(&kernel_name)?;
 
     // 4. Allocate + populate device buffers.
     let host_x: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let host_y: Vec<f32> = (0..N).map(|i| (i * 2) as f32).collect();
 
-    let dev_x = dev.htod_copy(host_x.clone())?;
-    let dev_y = dev.htod_copy(host_y.clone())?;
-    let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
+    let dev_x = stream.clone_htod(&host_x)?;
+    let dev_y = stream.clone_htod(&host_y)?;
+    let mut dev_out: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(N)?;
 
     // v3.6 implicit-arg buffers. Allocate at least 1 byte even when the
     // metadata reports size 0 — cudarc's auto-marshaller needs a real
     // CudaSlice to produce a CUdeviceptr; the kernel just won't read it
     // when the lowering pass set the size to 0.
     let scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
     let profile_scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
 
     // 5. Launch — Triton kernels expect (num_warps * 32) threads per block,
     //    and one block per BLOCK-element tile.
@@ -112,23 +106,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // v3.6 calling convention: 3 user pointers + 1 i32 + global_scratch
         // device-ptr + profile_scratch device-ptr (the lowering pipeline
         // appends both unconditionally; v3.2 didn't).
-        func.launch(
-            cfg,
-            (
-                &dev_x,
-                &dev_y,
-                &mut dev_out,
-                n_arg,
-                &scratch,
-                &profile_scratch,
-            ),
-        )?;
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&dev_x)
+            .arg(&dev_y)
+            .arg(&mut dev_out)
+            .arg(&n_arg)
+            .arg(&scratch)
+            .arg(&profile_scratch);
+        builder.launch(cfg)?;
     }
 
-    dev.synchronize()?;
+    stream.synchronize()?;
 
     // 6. Copy back and verify against the host reference.
-    let host_out = dev.dtoh_sync_copy(&dev_out)?;
+    let host_out = stream.clone_dtoh(&dev_out)?;
 
     let reference = |a: f32, b: f32| -> f32 {
         match op_kind.as_str() {

@@ -20,7 +20,7 @@ fn main() {
 
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
     use std::time::Instant;
 
@@ -43,13 +43,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const ITERS: usize = 200;
     const WARMUP: usize = 20;
 
-    let dev = CudaDevice::new(0)?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
 
     let host_a: Vec<f32> = (0..N).map(|i| (i as f32).sin()).collect();
     let host_b: Vec<f32> = (0..N).map(|i| (i as f32).cos()).collect();
-    let dev_a = dev.htod_copy(host_a.clone())?;
-    let dev_b = dev.htod_copy(host_b.clone())?;
-    let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
+    let dev_a = stream.clone_htod(&host_a)?;
+    let dev_b = stream.clone_htod(&host_b)?;
+    let mut dev_out: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(N)?;
     let n_arg: i32 = N as i32;
 
     let bytes_per_launch = (N * std::mem::size_of::<f32>() * 3) as f64;
@@ -73,10 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ptx = Ptx::from(std::fs::read_to_string(&ptx_path)?);
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&json_path)?)?;
-        let kernel_name: &'static str = Box::leak(
-            meta["name"].as_str().ok_or("name missing")?.to_string().into_boxed_str(),
-        );
-        let module_name: &'static str = Box::leak(format!("bench_{}", sub).into_boxed_str());
+        let kernel_name = meta["name"].as_str().ok_or("name missing")?.to_string();
         let compiled_via = meta["compiled_via"]
             .as_str()
             .unwrap_or("triton_mlir")
@@ -90,9 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let profile_scratch_size =
             meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
         let scratch: cudarc::driver::CudaSlice<u8> =
-            dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+            stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
         let profile_scratch: cudarc::driver::CudaSlice<u8> =
-            dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+            stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
 
         // Pick the launch shape that actually covers all N elements for
         // this kernel's compute model.
@@ -114,31 +112,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.block_dim.0
         );
 
-        dev.load_ptx(ptx, module_name, &[kernel_name])?;
-        let func = dev.get_func(module_name, kernel_name).ok_or("kernel not found")?;
+        let module = ctx.load_module(ptx)?;
+        let func = module.load_function(&kernel_name)?;
 
         for _ in 0..WARMUP {
             unsafe {
+                let mut builder = stream.launch_builder(&func);
+                builder
+                    .arg(&dev_a)
+                    .arg(&dev_b)
+                    .arg(&mut dev_out)
+                    .arg(&n_arg);
                 if needs_scratch {
-                    func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg, &scratch, &profile_scratch))?;
-                } else {
-                    func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?;
+                    builder.arg(&scratch).arg(&profile_scratch);
                 }
+                builder.launch(cfg)?;
             }
         }
-        dev.synchronize()?;
+        stream.synchronize()?;
 
         let t0 = Instant::now();
         for _ in 0..ITERS {
             unsafe {
+                let mut builder = stream.launch_builder(&func);
+                builder
+                    .arg(&dev_a)
+                    .arg(&dev_b)
+                    .arg(&mut dev_out)
+                    .arg(&n_arg);
                 if needs_scratch {
-                    func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg, &scratch, &profile_scratch))?;
-                } else {
-                    func.clone().launch(cfg, (&dev_a, &dev_b, &mut dev_out, n_arg))?;
+                    builder.arg(&scratch).arg(&profile_scratch);
                 }
+                builder.launch(cfg)?;
             }
         }
-        dev.synchronize()?;
+        stream.synchronize()?;
         let elapsed = t0.elapsed().as_secs_f64();
 
         let per_call = elapsed / ITERS as f64;
@@ -151,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Quick sanity check: spot-check the last result against the host
     // reference so we don't accidentally bench a no-op kernel.
-    let host_out = dev.dtoh_sync_copy(&dev_out)?;
+    let host_out = stream.clone_dtoh(&dev_out)?;
     let want = host_a[42] + host_b[42];
     let err = (host_out[42] - want).abs();
     println!();

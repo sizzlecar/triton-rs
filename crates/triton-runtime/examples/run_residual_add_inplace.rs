@@ -11,9 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ptx_path = args.next().ok_or("usage: PTX META")?;
     let meta_path = args.next().ok_or("usage: PTX META")?;
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-    let kernel_name: &'static str =
-        Box::leak(meta["name"].as_str().ok_or("name")?.to_string().into_boxed_str());
-    let module_name: &'static str = "triton_kernel";
+    let kernel_name = meta["name"].as_str().ok_or("name")?.to_string();
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
     // v3.6 implicit scratch args — see run_vec_add.rs.
@@ -25,30 +23,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const BLOCK: u32 = 1024;
     const N: usize = 4096;
 
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
-    let dev = CudaDevice::new(0)?;
-    dev.load_ptx(Ptx::from(std::fs::read_to_string(&ptx_path)?), module_name, &[kernel_name])?;
-    let func = dev.get_func(module_name, kernel_name).ok_or("kernel missing")?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from(std::fs::read_to_string(&ptx_path)?))?;
+    let func = module.load_function(&kernel_name)?;
 
     let host_a: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let host_b: Vec<f32> = (0..N).map(|i| (i * 2) as f32).collect();
-    let mut dev_a = dev.htod_copy(host_a.clone())?;
-    let dev_b = dev.htod_copy(host_b.clone())?;
+    let mut dev_a = stream.clone_htod(&host_a)?;
+    let dev_b = stream.clone_htod(&host_b)?;
 
     let scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
     let profile_scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
     let cfg = LaunchConfig {
         grid_dim: (((N as u32) + BLOCK - 1) / BLOCK, 1, 1),
         block_dim: (num_warps * 32, 1, 1),
         shared_mem_bytes: shared_mem,
     };
     let n_arg: i32 = N as i32;
-    unsafe { func.launch(cfg, (&mut dev_a, &dev_b, n_arg, &scratch, &profile_scratch))?; }
-    dev.synchronize()?;
-    let out = dev.dtoh_sync_copy(&dev_a)?;
+    unsafe {
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&mut dev_a)
+            .arg(&dev_b)
+            .arg(&n_arg)
+            .arg(&scratch)
+            .arg(&profile_scratch);
+        builder.launch(cfg)?;
+    }
+    stream.synchronize()?;
+    let out = stream.clone_dtoh(&dev_a)?;
 
     let mut max_err = 0f32;
     for i in 0..N {

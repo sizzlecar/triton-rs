@@ -16,14 +16,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let meta_text = std::fs::read_to_string(&meta_path)?;
     let meta: serde_json::Value = serde_json::from_str(&meta_text)?;
-    let kernel_name: &'static str = Box::leak(
-        meta["name"]
-            .as_str()
-            .ok_or("metadata.name missing")?
-            .to_string()
-            .into_boxed_str(),
-    );
-    let module_name: &'static str = "triton_kernel";
+    let kernel_name = meta["name"]
+        .as_str()
+        .ok_or("metadata.name missing")?
+        .to_string();
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
     // v3.6 implicit scratch args — see run_vec_add.rs.
@@ -35,24 +31,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const BLOCK: u32 = 1024;
     const N: usize = 4096;
 
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
 
-    let dev = CudaDevice::new(0)?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
     let ptx_text = std::fs::read_to_string(&ptx_path)?;
-    dev.load_ptx(Ptx::from(ptx_text), module_name, &[kernel_name])?;
-    let func = dev.get_func(module_name, kernel_name).ok_or("kernel not found")?;
+    let module = ctx.load_module(Ptx::from(ptx_text))?;
+    let func = module.load_function(&kernel_name)?;
 
     // Spread inputs across a useful range for activation testing.
     let host_x: Vec<f32> = (0..N).map(|i| (i as f32 - N as f32 * 0.5) / 256.0).collect();
-    let dev_x = dev.htod_copy(host_x.clone())?;
-    let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
+    let dev_x = stream.clone_htod(&host_x)?;
+    let mut dev_out: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(N)?;
 
     let grid_x = ((N as u32) + BLOCK - 1) / BLOCK;
     let scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
     let profile_scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
     let cfg = LaunchConfig {
         grid_dim: (grid_x, 1, 1),
         block_dim: (num_warps * 32, 1, 1),
@@ -62,11 +59,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_arg: i32 = N as i32;
     unsafe {
         // 2-pointer + i32 calling convention.
-        func.launch(cfg, (&dev_x, &mut dev_out, n_arg, &scratch, &profile_scratch))?;
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&dev_x)
+            .arg(&mut dev_out)
+            .arg(&n_arg)
+            .arg(&scratch)
+            .arg(&profile_scratch);
+        builder.launch(cfg)?;
     }
-    dev.synchronize()?;
+    stream.synchronize()?;
 
-    let host_out = dev.dtoh_sync_copy(&dev_out)?;
+    let host_out = stream.clone_dtoh(&dev_out)?;
 
     // GELU reference (PyTorch default, erf-based).
     let gelu = |x: f32| -> f32 {

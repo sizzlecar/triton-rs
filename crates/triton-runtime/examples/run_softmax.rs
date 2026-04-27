@@ -8,9 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ptx_path = args.next().ok_or("usage: PTX META")?;
     let meta_path = args.next().ok_or("usage: PTX META")?;
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-    let kernel_name: &'static str =
-        Box::leak(meta["name"].as_str().ok_or("name")?.to_string().into_boxed_str());
-    let module_name: &'static str = "triton_kernel";
+    let kernel_name = meta["name"].as_str().ok_or("name")?.to_string();
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
     // v3.6 implicit scratch args — see run_vec_add.rs.
@@ -22,24 +20,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const ROWS: usize = 8;
     const COLS: usize = 1024;
 
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
-    let dev = CudaDevice::new(0)?;
-    dev.load_ptx(Ptx::from(std::fs::read_to_string(&ptx_path)?), module_name, &[kernel_name])?;
-    let func = dev.get_func(module_name, kernel_name).ok_or("kernel missing")?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from(std::fs::read_to_string(&ptx_path)?))?;
+    let func = module.load_function(&kernel_name)?;
 
     // Vary inputs across rows to stress the per-row reduce.
     let host_in: Vec<f32> = (0..ROWS * COLS)
         .map(|i| (((i % COLS) as f32) - 512.0) * 0.01 * ((i / COLS + 1) as f32))
         .collect();
 
-    let dev_in = dev.htod_copy(host_in.clone())?;
-    let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(ROWS * COLS)?;
+    let dev_in = stream.clone_htod(&host_in)?;
+    let mut dev_out: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(ROWS * COLS)?;
 
     let scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
     let profile_scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
     let cfg = LaunchConfig {
         grid_dim: (ROWS as u32, 1, 1),
         block_dim: (num_warps * 32, 1, 1),
@@ -47,9 +46,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let rows: i32 = ROWS as i32;
     let cols: i32 = COLS as i32;
-    unsafe { func.launch(cfg, (&dev_in, &mut dev_out, rows, cols, &scratch, &profile_scratch))?; }
-    dev.synchronize()?;
-    let out = dev.dtoh_sync_copy(&dev_out)?;
+    unsafe {
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&dev_in)
+            .arg(&mut dev_out)
+            .arg(&rows)
+            .arg(&cols)
+            .arg(&scratch)
+            .arg(&profile_scratch);
+        builder.launch(cfg)?;
+    }
+    stream.synchronize()?;
+    let out = stream.clone_dtoh(&dev_out)?;
 
     // Host softmax reference.
     let mut max_err = 0f32;

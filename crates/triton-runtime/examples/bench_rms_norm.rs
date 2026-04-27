@@ -10,7 +10,7 @@ fn main() { eprintln!("requires --features cuda"); std::process::exit(1); }
 
 #[cfg(feature = "cuda")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
     use std::time::Instant;
 
@@ -30,7 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const ITERS: usize = 100;
     const WARMUP: usize = 10;
 
-    let dev = CudaDevice::new(0)?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
 
     // input/weight/output: same set across all three so benchmarks compare
     // on identical memory state.
@@ -39,9 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let host_w: Vec<f32> = (0..ROW_SIZE).map(|i| 1.0 + (i as f32) * 0.001).collect();
 
-    let dev_in = dev.htod_copy(host_in.clone())?;
-    let dev_w = dev.htod_copy(host_w.clone())?;
-    let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(ROWS * ROW_SIZE)?;
+    let dev_in = stream.clone_htod(&host_in)?;
+    let dev_w = stream.clone_htod(&host_w)?;
+    let mut dev_out: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(ROWS * ROW_SIZE)?;
 
     let row_size: i32 = ROW_SIZE as i32;
     let eps: f32 = EPS;
@@ -69,10 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ptx = Ptx::from(std::fs::read_to_string(&ptx_path)?);
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&json_path)?)?;
-        let kernel_name: &'static str = Box::leak(
-            meta["name"].as_str().ok_or("name missing")?.to_string().into_boxed_str(),
-        );
-        let module_name: &'static str = Box::leak(format!("bench_rms_{}", sub).into_boxed_str());
+        let kernel_name = meta["name"].as_str().ok_or("name missing")?.to_string();
         let compiled_via = meta["compiled_via"]
             .as_str()
             .unwrap_or("triton_mlir")
@@ -80,9 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let global_scratch_size = meta["global_scratch_size"].as_u64().unwrap_or(0) as usize;
         let profile_scratch_size = meta["profile_scratch_size"].as_u64().unwrap_or(0) as usize;
         let scratch: cudarc::driver::CudaSlice<u8> =
-            dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+            stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
         let profile_scratch: cudarc::driver::CudaSlice<u8> =
-            dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+            stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
 
         let cfg = match compiled_via.as_str() {
             "nvcc" => LaunchConfig {
@@ -98,33 +96,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let grid_block_str = format!("{}×{}", cfg.grid_dim.0, cfg.block_dim.0);
 
-        dev.load_ptx(ptx, module_name, &[kernel_name])?;
-        let func = dev.get_func(module_name, kernel_name).ok_or("kernel not found")?;
+        let module = ctx.load_module(ptx)?;
+        let func = module.load_function(&kernel_name)?;
 
         // Per-frontend arg list:
         //   ferrum: (input, weight, output, row_size, eps)
         //   triton-rs DSL + Python: (input, weight, output, row_size, inv_n, eps)
         macro_rules! launch_one {
-            () => {
+            () => {{
+                let mut builder = stream.launch_builder(&func);
                 if compiled_via == "nvcc" {
-                    func.clone().launch(cfg, (&dev_in, &dev_w, &mut dev_out, row_size, eps))?
+                    builder
+                        .arg(&dev_in)
+                        .arg(&dev_w)
+                        .arg(&mut dev_out)
+                        .arg(&row_size)
+                        .arg(&eps);
                 } else {
                     // v3.6 — append global_scratch + profile_scratch to user args.
-                    func.clone().launch(cfg, (&dev_in, &dev_w, &mut dev_out, row_size, inv_n, eps, &scratch, &profile_scratch))?
+                    builder
+                        .arg(&dev_in)
+                        .arg(&dev_w)
+                        .arg(&mut dev_out)
+                        .arg(&row_size)
+                        .arg(&inv_n)
+                        .arg(&eps)
+                        .arg(&scratch)
+                        .arg(&profile_scratch);
                 }
-            };
+                builder.launch(cfg)?
+            }};
         }
 
         for _ in 0..WARMUP {
             unsafe { launch_one!(); }
         }
-        dev.synchronize()?;
+        stream.synchronize()?;
 
         let t0 = Instant::now();
         for _ in 0..ITERS {
             unsafe { launch_one!(); }
         }
-        dev.synchronize()?;
+        stream.synchronize()?;
         let elapsed = t0.elapsed().as_secs_f64();
 
         let per_call = elapsed / ITERS as f64;
@@ -136,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Sanity check the last-benchmarked kernel.
-    let host_out = dev.dtoh_sync_copy(&dev_out)?;
+    let host_out = stream.clone_dtoh(&dev_out)?;
     // Compute host reference for row 0.
     let row = &host_in[..ROW_SIZE];
     let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() * inv_n;
