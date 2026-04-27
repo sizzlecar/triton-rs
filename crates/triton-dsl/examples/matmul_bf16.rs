@@ -67,14 +67,15 @@ pub fn matmul_typed<T: TritonElem, const BM: usize, const BN: usize, const BK: u
 
         let a_off = offs_m_2d * stride_am + offs_k_row * stride_ak;
         let mask_a = expand_dims(mask_m, 1) & expand_dims(mask_k, 0);
-        let a_block_t = load(a_ptr + a_off, mask_a);
-        let a_block = to_f32(a_block_t);
+        let a_block = load(a_ptr + a_off, mask_a);
 
         let b_off = offs_k_col * stride_bk + offs_n_2d * stride_bn;
         let mask_b = expand_dims(mask_k, 1) & expand_dims(mask_n, 0);
-        let b_block_t = load(b_ptr + b_off, mask_b);
-        let b_block = to_f32(b_block_t);
+        let b_block = load(b_ptr + b_off, mask_b);
 
+        // dot has bf16 inputs + f32 accumulator → native bf16-bf16-f32
+        // Tensor-Core mma. No extf chain, no f32 mma fallback. (For
+        // T == f32 instantiations this collapses to f32-f32-f32 dot.)
         dot(a_block, b_block, acc)
     });
 

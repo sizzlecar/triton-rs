@@ -98,22 +98,22 @@ pub fn matmul_typed<T: TritonElem, const BM: usize, const BN: usize, const BK: u
         let mask_k_row = expand_dims(mask_k, 0); // [1, BK]
         let mask_m_col = expand_dims(mask_m, 1); // [BM, 1]
         let mask_a = mask_m_col & mask_k_row; // [BM, BK] i1
-        let a_block_t = load(a_ptr + a_off, mask_a); // [BM, BK] T
-        let a_block = to_f32(a_block_t); // [BM, BK] f32
+        let a_block = load(a_ptr + a_off, mask_a); // [BM, BK] T
 
         // ── B tile [BK, BN] address: k * stride_bk + n * stride_bn ──
         let b_off = offs_k_col * stride_bk + offs_n_2d * stride_bn; // [BK, BN] i32
         let mask_k_col = expand_dims(mask_k, 1); // [BK, 1]
         let mask_n_row = expand_dims(mask_n, 0); // [1, BN]
         let mask_b = mask_k_col & mask_n_row; // [BK, BN] i1
-        let b_block_t = load(b_ptr + b_off, mask_b); // [BK, BN] T
-        let b_block = to_f32(b_block_t); // [BK, BN] f32
+        let b_block = load(b_ptr + b_off, mask_b); // [BK, BN] T
 
         // ── block matmul: acc += A_block @ B_block ──
-        // a/b are now f32, c is f32 — dot result is f32. For T == f32
-        // this matches matmul_f32 exactly; for T == f16 / bf16 the load
-        // boundary upcast and the store boundary downcast bracket the
-        // f32-internal compute.
+        // a/b stay at native dtype T; c is f32. For T == f16 / bf16 the
+        // dot is `tt.dot %a_typed, %b_typed, %c_f32 -> %f32`, which
+        // Triton lowers to native Tensor-Core mma (f16-f16-f32 / bf16-
+        // bf16-f32) — no extf chain at the dot boundary, no f32 mma
+        // fallback. For T == f32 this collapses to f32-f32-f32 dot
+        // identical to matmul_f32. Output downcast happens at store time.
         dot(a_block, b_block, acc)
     });
 
