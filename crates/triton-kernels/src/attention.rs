@@ -1032,16 +1032,31 @@ pub fn unified_attention_f32<const HEAD_DIM: usize, const BLOCK_Q: usize, const 
             let row_base_2d = expand_dims(row_base, 1); // [BLOCK_KV, 1]
             let kv_off_2d = row_base_2d + dim_2d; // [BLOCK_KV, HEAD_DIM]
 
-            let k_tile = load(k_cache_ptr + kv_off_2d); // [BLOCK_KV, HEAD_DIM]
+            // V uses the natural [BLOCK_KV, HEAD_DIM] layout — straight
+            // input to the second `dot` (P · V).
             let v_tile = load(v_cache_ptr + kv_off_2d); // [BLOCK_KV, HEAD_DIM]
 
-            // ── scores = Q · Kᵀ ── (broadcast-mul-reduce over HEAD_DIM)
-            // Same pattern as flash_attn_full. tt.dot is a follow-up
-            // optimization for HEAD_DIM ≥ 64.
-            let q_3d = expand_dims(q_tile, 1); // [BLOCK_Q, 1, HEAD_DIM]
-            let k_3d = expand_dims(k_tile, 0); // [1, BLOCK_KV, HEAD_DIM]
-            let qk = q_3d * k_3d; // [BLOCK_Q, BLOCK_KV, HEAD_DIM]
-            let scores_raw = reduce(qk, 2, |a, b| a + b); // [BLOCK_Q, BLOCK_KV]
+            // K is loaded TRANSPOSED to [HEAD_DIM, BLOCK_KV] so that
+            // `dot(Q[BLOCK_Q,HEAD_DIM], K_T[HEAD_DIM,BLOCK_KV])` produces
+            // [BLOCK_Q, BLOCK_KV] without a separate transpose op.
+            // Pointer math: same scalars as kv_off_2d, just swap which axis
+            // is the row vs col. We reuse `dim_range` and `row_base` since
+            // they're already in scope.
+            let dim_col_2d = expand_dims(dim_range, 1); // [HEAD_DIM, 1]
+            let row_base_row_2d = expand_dims(row_base, 0); // [1, BLOCK_KV]
+            let k_off_t_2d = dim_col_2d + row_base_row_2d; // [HEAD_DIM, BLOCK_KV]
+            let k_tile_t = load(k_cache_ptr + k_off_t_2d); // [HEAD_DIM, BLOCK_KV]
+
+            // ── scores = Q · Kᵀ ── via tt.dot (MMA hardware).
+            // Replaces the 3D broadcast-mul-reduce path; cuts PTX size 5-10x
+            // and runs on Tensor Cores instead of unrolled fmuls.
+            // Need a fresh [BLOCK_Q, BLOCK_KV] f32 zero accumulator (same
+            // idiom as `matmul_f32`).
+            let qk_zero_seed = splat_1d(const_f32(0.0_f32), 1); // [1]
+            let qk_zero_2d_seed = expand_dims(qk_zero_seed, 0); // [1, 1]
+            let qk_acc =
+                broadcast_2d(qk_zero_2d_seed, BLOCK_Q as i64, BLOCK_KV as i64); // [BLOCK_Q, BLOCK_KV]
+            let scores_raw = dot(q_tile, k_tile_t, qk_acc); // [BLOCK_Q, BLOCK_KV]
             let scores_scaled = scores_raw * sm_scale;
 
             // ── mask construction ──
@@ -1077,14 +1092,14 @@ pub fn unified_attention_f32<const HEAD_DIM: usize, const BLOCK_Q: usize, const 
             let p = exp(masked_scores - expand_dims(m_ij, 1)); // [BLOCK_Q, BLOCK_KV]
             let l_ij = reduce(p, 1, |a, b| a + b); // [BLOCK_Q]
 
-            // ── pv accumulate ──
-            let p_3d = expand_dims(p, 2); // [BLOCK_Q, BLOCK_KV, 1]
-            let v_3d = expand_dims(v_tile, 0); // [1, BLOCK_KV, HEAD_DIM]
-            let pv = p_3d * v_3d; // [BLOCK_Q, BLOCK_KV, HEAD_DIM]
-            let pv_sum = reduce(pv, 1, |a, b| a + b); // [BLOCK_Q, HEAD_DIM]
-
-            let alpha_2d = expand_dims(alpha, 1);
-            let new_acc = acc * alpha_2d + pv_sum;
+            // ── pv accumulate via tt.dot ──
+            // pv_sum = dot(P[BLOCK_Q,BLOCK_KV], V[BLOCK_KV,HEAD_DIM]) and
+            // online softmax wants `acc = acc * alpha + pv_sum`. Fold
+            // alpha-scaling into the dot's accumulator: pass `acc * alpha`
+            // as the init and the final `dot` returns `acc * alpha + P · V`.
+            let alpha_2d = expand_dims(alpha, 1); // [BLOCK_Q, 1]
+            let scaled_acc = acc * alpha_2d; // [BLOCK_Q, HEAD_DIM]
+            let new_acc = dot(p, v_tile, scaled_acc); // [BLOCK_Q, HEAD_DIM]
             let new_l_i = l_i * alpha + l_ij;
             (m_ij, new_l_i, new_acc)
         },
