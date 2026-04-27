@@ -284,6 +284,100 @@ impl<'m> FuncBuilder<'m> {
         ))
     }
 
+    /// High-level `scf.if` construction. Pushes a fresh region for the
+    /// `then` branch, runs `then_fn` (which can use `self.op_one` etc. — those
+    /// calls land in the then-region thanks to the region_stack), appends an
+    /// `scf.yield` of the values returned by the closure, then pops the
+    /// region. Repeats for the `else` branch.
+    ///
+    /// Result types are derived from the `then`-branch yield: for each value
+    /// the closure returns, the corresponding result type is `value.ty()`.
+    /// The `else`-branch closure must return matching count + types — the
+    /// builder asserts the count via debug_assert; the type-match is left
+    /// to MLIR verification.
+    ///
+    /// Pass a closure that returns `vec![]` for the side-effect-only
+    /// "statement form" `scf.if`. For the no-else shape, see
+    /// [`Self::if_then_with`].
+    ///
+    /// Nested `if_then_else_with` and `for_loop_with` calls work
+    /// transparently — the region stack keeps track.
+    pub fn if_then_else_with<F1, F2>(
+        &mut self,
+        cond: Value,
+        then_fn: F1,
+        else_fn: F2,
+    ) -> Vec<Value>
+    where
+        F1: FnOnce(&mut FuncBuilder<'m>) -> Vec<Value>,
+        F2: FnOnce(&mut FuncBuilder<'m>) -> Vec<Value>,
+    {
+        // Build the then-region. Derive `result_tys` from its yields.
+        let then_region = Region {
+            blocks: vec![Block::new()],
+        };
+        self.region_stack.push(then_region);
+        let then_yields = then_fn(self);
+        let result_tys: Vec<Type> = then_yields.iter().map(|v| v.ty().clone()).collect();
+        self.op_void(crate::dialect::scf::yield_(then_yields));
+        let then_region = self
+            .region_stack
+            .pop()
+            .expect("if_then_else_with stack underflow — then region was popped twice");
+
+        // Build the else-region.
+        let else_region = Region {
+            blocks: vec![Block::new()],
+        };
+        self.region_stack.push(else_region);
+        let else_yields = else_fn(self);
+        debug_assert_eq!(
+            else_yields.len(),
+            result_tys.len(),
+            "scf.if: then branch yielded {} values, else branch yielded {}",
+            result_tys.len(),
+            else_yields.len()
+        );
+        self.op_void(crate::dialect::scf::yield_(else_yields));
+        let else_region = self
+            .region_stack
+            .pop()
+            .expect("if_then_else_with stack underflow — else region was popped twice");
+
+        // Construct the scf.if op and append it to the outer region.
+        self.op(crate::dialect::scf::if_then_else(
+            cond,
+            result_tys,
+            then_region,
+            else_region,
+        ))
+    }
+
+    /// `scf.if` with no result types and no else branch. The else region
+    /// is still emitted as a single `scf.yield` (terminator required by
+    /// MLIR), but it carries no operands.
+    ///
+    /// This is the common shape for guard-style early-return patterns:
+    /// `if cond { do_stuff(); }` — `do_stuff` runs only when `cond` is
+    /// true, no value flows out of either branch.
+    pub fn if_then_with<F>(&mut self, cond: Value, then_fn: F)
+    where
+        F: FnOnce(&mut FuncBuilder<'m>),
+    {
+        let results = self.if_then_else_with(
+            cond,
+            |b| {
+                then_fn(b);
+                Vec::new()
+            },
+            |_b| Vec::new(),
+        );
+        debug_assert!(
+            results.is_empty(),
+            "if_then_with: scf.if with no result types should produce no results"
+        );
+    }
+
     /// High-level `tt.reduce` construction. Pushes a fresh region for the
     /// reducer body, runs `body_fn(lhs, rhs)` to produce the combined value,
     /// appends a `tt.reduce.return`, then pops and constructs the
