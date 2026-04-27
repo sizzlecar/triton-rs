@@ -16,8 +16,8 @@
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
-    spanned::Spanned, BinOp, Block, Expr, ExprBinary, ExprCall, ExprClosure, FnArg, ItemFn, Local,
-    Pat, PathArguments, Stmt, Type,
+    spanned::Spanned, BinOp, Block, Expr, ExprBinary, ExprCall, ExprClosure, ExprIf, FnArg, ItemFn,
+    Local, Pat, PathArguments, Stmt, Type,
 };
 
 /// Top-level expansion entry point.
@@ -258,6 +258,15 @@ fn translate_block(block: &Block, counter: &mut u32) -> Result<TokenStream2, syn
 fn translate_stmt(stmt: &Stmt, counter: &mut u32) -> Result<TokenStream2, syn::Error> {
     match stmt {
         Stmt::Local(local) => translate_local(local, counter),
+        // `if` appearing as a statement (with or without semicolon) is the
+        // side-effect-only "statement form": no value flows out, the else
+        // branch is optional. Route through `translate_if_statement_form`
+        // which emits `__triton_f.if_then_with(...)` (or
+        // `if_then_else_with(...)` with empty yields when an else is
+        // present). Avoids forcing the user's `if pid < n { store(...) }`
+        // through the value-yielding code path that would demand both
+        // branches yield something.
+        Stmt::Expr(Expr::If(ei), _maybe_semi) => translate_if_statement_form(ei, counter),
         Stmt::Expr(expr, maybe_semi) => {
             // Top-level statement: no need to hoist a top-level call (the
             // statement boundary already releases the borrow).
@@ -314,6 +323,11 @@ fn translate_expr(
     match expr {
         Expr::Call(call) => translate_call(call, hoist, counter),
         Expr::Binary(b) => translate_binop(b, hoist, counter),
+        // `if cond { a } else { b }` as a value-producing expression. Both
+        // branches required and must end with a trailing yield expr.
+        // Statement-form `if cond { ... }` is handled in `translate_stmt`
+        // and never reaches here.
+        Expr::If(ei) => translate_if_expr(ei, hoist, counter),
         // Variable references appear at every use site. `triton_ir::Value`
         // is `Clone` but not `Copy`, so emit an explicit `.clone()` at every
         // reference. Cloning a Value is cheap (one Type box for tensors,
@@ -1053,6 +1067,224 @@ fn translate_reduce(
         )
     };
 
+    Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
+}
+
+// ── scf.if translation ─────────────────────────────────────────────────
+//
+// Two entry points:
+//   - `translate_if_statement_form` — for `if cond { ... } [else { ... }]`
+//     appearing as a statement. Side-effect-only, no value flows out. Else
+//     branch is optional. Emits `__triton_f.if_then_with(...)` (no else)
+//     or `__triton_f.if_then_else_with(...)` returning empty yields (with
+//     else).
+//   - `translate_if_expr` — for `if cond { a } else { b }` appearing as a
+//     value-producing expression (e.g. `let v = if ... { ... } else { ... };`).
+//     Both branches required; each block's trailing expression is the
+//     yield value. Emits `__triton_f.if_then_else_with(...)` and pulls
+//     the single Value back out of the returned Vec.
+//
+// Else-if chains (`else if ...`) are deliberately rejected for v1 with a
+// clear error — supporting them well needs nested scf.if desugaring that
+// adds material code and isn't required by current kernels.
+
+/// Translate the body block of an `if` branch into the closure body that
+/// runs against `__triton_f` inside that branch's region. `expect_yield`
+/// determines whether the trailing block expression is treated as a
+/// yielded Value (expression form) or simply discarded (statement form).
+///
+/// Returns a TokenStream that ends with a `Vec::<Value>` literal — the
+/// closure body for `if_then_else_with` expects this return type.
+fn translate_if_branch_block(
+    block: &Block,
+    expect_yield: bool,
+    counter: &mut u32,
+) -> Result<TokenStream2, syn::Error> {
+    if expect_yield {
+        // Expression form: must end with a non-semi trailing expression.
+        let (init_stmts, yield_expr) = split_block_for_yield(block, counter)?;
+        let yield_t = translate_expr(yield_expr, /*hoist=*/ false, counter)?;
+        let yield_setup = yield_t.setup;
+        let yield_e = yield_t.expr;
+        Ok(quote! {
+            #(#init_stmts)*
+            #(#yield_setup)*
+            ::std::vec![#yield_e]
+        })
+    } else {
+        // Statement form: every stmt is a side effect, drop any trailing expr.
+        let mut translated = Vec::with_capacity(block.stmts.len());
+        for stmt in &block.stmts {
+            translated.push(translate_stmt(stmt, counter)?);
+        }
+        Ok(quote! {
+            #(#translated)*
+            ::std::vec::Vec::<::triton_ir::value::Value>::new()
+        })
+    }
+}
+
+/// Statement-form `if cond { ... } [else { ... }]`. No value flows out.
+/// The condition must be a scalar `i1` (typically produced by a comparison
+/// like `pid < n`) — a tensor cond doesn't make sense at the statement
+/// level and the IR builder will reject it at MLIR-verification time.
+fn translate_if_statement_form(
+    ei: &ExprIf,
+    counter: &mut u32,
+) -> Result<TokenStream2, syn::Error> {
+    // Translate cond. Force-hoist so it's evaluated before the closure is
+    // built — same pattern as scf_for's lb/ub/step.
+    let cond_t = translate_expr(&ei.cond, /*hoist=*/ true, counter)?;
+    let cond_setup = cond_t.setup;
+    let cond_expr = cond_t.expr;
+
+    let then_body_ts = translate_if_branch_block(
+        &ei.then_branch,
+        /*expect_yield=*/ false,
+        counter,
+    )?;
+
+    match &ei.else_branch {
+        None => {
+            // No else: emit `if_then_with` which writes an empty else region.
+            // The body emits side-effect ops as statements, then ends with a
+            // dummy `Vec::<Value>::new()`. `if_then_with` takes a closure that
+            // returns `()`, so we drop the trailing Vec via a let-binding to
+            // `_` inside a fresh block (the let must be braced — `let _ =`
+            // followed by raw statements + expr is a parse error).
+            Ok(quote! {
+                #(#cond_setup)*
+                __triton_f.if_then_with(
+                    #cond_expr,
+                    |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>| {
+                        let _: ::std::vec::Vec<::triton_ir::value::Value> = {
+                            #then_body_ts
+                        };
+                    },
+                );
+            })
+        }
+        Some((_else_tok, else_expr)) => {
+            // The `else` branch can be a Block or another `if` (else-if
+            // chain). For v1 we reject else-if; nested `else { if ... }`
+            // works because the inner Expr::If lands back in this same
+            // statement-form translator.
+            let else_body_ts = match &**else_expr {
+                Expr::Block(eb) => translate_if_branch_block(
+                    &eb.block,
+                    /*expect_yield=*/ false,
+                    counter,
+                )?,
+                Expr::If(_) => {
+                    return Err(syn::Error::new(
+                        else_expr.span(),
+                        "`else if` chains are not yet supported in #[triton_kernel] bodies — \
+                         use a nested `else { if ... }` block instead",
+                    ));
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        other.span(),
+                        "`else` branch must be a block `{ ... }`",
+                    ));
+                }
+            };
+            Ok(quote! {
+                #(#cond_setup)*
+                {
+                    let __triton_results = __triton_f.if_then_else_with(
+                        #cond_expr,
+                        |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>|
+                         -> ::std::vec::Vec<::triton_ir::value::Value> {
+                            #then_body_ts
+                        },
+                        |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>|
+                         -> ::std::vec::Vec<::triton_ir::value::Value> {
+                            #else_body_ts
+                        },
+                    );
+                    debug_assert!(
+                        __triton_results.is_empty(),
+                        "statement-form scf.if must not yield values"
+                    );
+                }
+            })
+        }
+    }
+}
+
+/// Expression-form `let v = if cond { a } else { b };`. Both branches
+/// required; each must end with a trailing expression that becomes the
+/// yielded value. Result is a single `Value` — multi-yield tuples are
+/// not supported in v1 (would need to mirror scf_for's tuple return).
+fn translate_if_expr(
+    ei: &ExprIf,
+    hoist: bool,
+    counter: &mut u32,
+) -> Result<TranslatedExpr, syn::Error> {
+    // Cond → Value.
+    let cond_t = translate_expr(&ei.cond, /*hoist=*/ true, counter)?;
+    let setup = cond_t.setup;
+    let cond_expr = cond_t.expr;
+
+    // Both branches required for the value-yielding form.
+    let (_else_tok, else_expr) = ei.else_branch.as_ref().ok_or_else(|| {
+        syn::Error::new(
+            ei.span(),
+            "value-yielding `if` requires both branches: \
+             `if cond { a } else { b }` (statement-form `if cond { stmt }` \
+             is fine, but only when not used as an rvalue)",
+        )
+    })?;
+
+    // Else must be a block. Else-if chains are deferred to v2.
+    let else_block = match &**else_expr {
+        Expr::Block(eb) => &eb.block,
+        Expr::If(_) => {
+            return Err(syn::Error::new(
+                else_expr.span(),
+                "`else if` chains are not yet supported in #[triton_kernel] bodies — \
+                 use a nested `else { if ... else { ... } }` block instead",
+            ));
+        }
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "`else` branch must be a block `{ ... }`",
+            ));
+        }
+    };
+
+    let then_body_ts = translate_if_branch_block(
+        &ei.then_branch,
+        /*expect_yield=*/ true,
+        counter,
+    )?;
+    let else_body_ts = translate_if_branch_block(
+        else_block,
+        /*expect_yield=*/ true,
+        counter,
+    )?;
+
+    // The IR builder derives the result type from the then-branch's yields,
+    // so the closures simply return `vec![yield_value]`.
+    let call_expr = quote! {
+        {
+            let __triton_results = __triton_f.if_then_else_with(
+                #cond_expr,
+                |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>|
+                 -> ::std::vec::Vec<::triton_ir::value::Value> {
+                    #then_body_ts
+                },
+                |__triton_f: &mut ::triton_ir::module::FuncBuilder<'_>|
+                 -> ::std::vec::Vec<::triton_ir::value::Value> {
+                    #else_body_ts
+                },
+            );
+            __triton_results.into_iter().next()
+                .expect("value-yielding scf.if must return exactly one Value")
+        }
+    };
     Ok(maybe_hoist(setup, call_expr, CallKind::Value, hoist, counter))
 }
 
