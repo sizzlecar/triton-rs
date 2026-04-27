@@ -81,8 +81,8 @@ impl Compiled {
     }
 
     /// PTX text — emitted by LLVM's NVPTX backend before ptxas. Use
-    /// this with cudarc 0.13's `Ptx::from(...)` (which only accepts
-    /// PTX text, not raw cubin). Empty when backend is non-NVIDIA.
+    /// this with cudarc's `Ptx::from(...)` (which only accepts PTX
+    /// text, not raw cubin). Empty when backend is non-NVIDIA.
     pub fn ptx_text(&self) -> &str {
         &self.ptx_text
     }

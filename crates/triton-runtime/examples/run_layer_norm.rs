@@ -8,9 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ptx_path = args.next().ok_or("usage: PTX META")?;
     let meta_path = args.next().ok_or("usage: PTX META")?;
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-    let kernel_name: &'static str =
-        Box::leak(meta["name"].as_str().ok_or("name")?.to_string().into_boxed_str());
-    let module_name: &'static str = "triton_kernel";
+    let kernel_name = meta["name"].as_str().ok_or("name")?.to_string();
     let num_warps = meta["num_warps"].as_u64().unwrap_or(4) as u32;
     let shared_mem = meta["shared_mem"].as_u64().unwrap_or(0) as u32;
     // v3.6 implicit scratch args — see run_vec_add.rs.
@@ -23,25 +21,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const DIM: usize = 768;
     const EPS: f32 = 1e-5;
 
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
-    let dev = CudaDevice::new(0)?;
-    dev.load_ptx(Ptx::from(std::fs::read_to_string(&ptx_path)?), module_name, &[kernel_name])?;
-    let func = dev.get_func(module_name, kernel_name).ok_or("kernel missing")?;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(Ptx::from(std::fs::read_to_string(&ptx_path)?))?;
+    let func = module.load_function(&kernel_name)?;
 
     let host_x: Vec<f32> = (0..ROWS * DIM).map(|i| ((i as f32) * 0.0173).sin()).collect();
     let host_g: Vec<f32> = (0..DIM).map(|i| 1.0 + (i as f32) * 0.001).collect();
     let host_b: Vec<f32> = (0..DIM).map(|i| (i as f32) * 0.0001).collect();
 
-    let dev_x = dev.htod_copy(host_x.clone())?;
-    let dev_g = dev.htod_copy(host_g.clone())?;
-    let dev_b = dev.htod_copy(host_b.clone())?;
-    let mut dev_o: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(ROWS * DIM)?;
+    let dev_x = stream.clone_htod(&host_x)?;
+    let dev_g = stream.clone_htod(&host_g)?;
+    let dev_b = stream.clone_htod(&host_b)?;
+    let mut dev_o: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(ROWS * DIM)?;
 
     let scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(global_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(global_scratch_size.max(1))?;
     let profile_scratch: cudarc::driver::CudaSlice<u8> =
-        dev.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
+        stream.alloc_zeros::<u8>(profile_scratch_size.max(1))?;
     let cfg = LaunchConfig {
         grid_dim: (ROWS as u32, 1, 1),
         block_dim: (num_warps * 32, 1, 1),
@@ -50,9 +49,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dim: i32 = DIM as i32;
     let inv_n: f32 = 1.0 / (DIM as f32);
     let eps: f32 = EPS;
-    unsafe { func.launch(cfg, (&dev_x, &dev_g, &dev_b, &mut dev_o, dim, inv_n, eps, &scratch, &profile_scratch))?; }
-    dev.synchronize()?;
-    let out = dev.dtoh_sync_copy(&dev_o)?;
+    unsafe {
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&dev_x)
+            .arg(&dev_g)
+            .arg(&dev_b)
+            .arg(&mut dev_o)
+            .arg(&dim)
+            .arg(&inv_n)
+            .arg(&eps)
+            .arg(&scratch)
+            .arg(&profile_scratch);
+        builder.launch(cfg)?;
+    }
+    stream.synchronize()?;
+    let out = stream.clone_dtoh(&dev_o)?;
 
     // Match the kernel's compute order: it multiplies by inv_n rather than
     // dividing by DIM, and uses GPU `rsqrt` (1-ULP-off hardware special-fn)

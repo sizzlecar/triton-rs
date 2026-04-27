@@ -45,7 +45,7 @@ fn main() {
 
 #[cfg(all(feature = "compile-triton", feature = "cuda"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::Ptx;
     use triton_core::sys::{CompileOptions, Context};
 
@@ -70,22 +70,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Parse out the kernel name (the proc-macro doesn't promise the
     //    Rust function name = MLIR symbol name, so use the JSON).
     let kernel_name = parse_kernel_name(compiled.metadata_json());
-    let kernel_static: &'static str = Box::leak(kernel_name.clone().into_boxed_str());
-    let module_static: &'static str = "ferrum_demo";
 
-    // 5. Load the PTX via cudarc 0.13 (which doesn't have load_cubin —
-    //    uses the PTX text we got from the shim).
-    let dev = CudaDevice::new(0)?;
-    dev.load_ptx(Ptx::from(compiled.ptx_text().to_string()), module_static, &[kernel_static])?;
-    let func = dev.get_func(module_static, kernel_static).ok_or("kernel not found")?;
+    // 5. Load the PTX via cudarc 0.19 (load_module takes a Ptx; cudarc
+    //    doesn't expose load_cubin directly, so we still use PTX text).
+    let cu_ctx = CudaContext::new(0)?;
+    let stream = cu_ctx.default_stream();
+    let module = cu_ctx.load_module(Ptx::from(compiled.ptx_text().to_string()))?;
+    let func = module.load_function(&kernel_name)?;
 
     // 6. Allocate buffers + launch.
     const N: usize = 1 << 20; // 1M elements
     let host_x: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let host_y: Vec<f32> = (0..N).map(|i| (i * 2) as f32).collect();
-    let dev_x = dev.htod_copy(host_x.clone())?;
-    let dev_y = dev.htod_copy(host_y.clone())?;
-    let mut dev_out: cudarc::driver::CudaSlice<f32> = dev.alloc_zeros::<f32>(N)?;
+    let dev_x = stream.clone_htod(&host_x)?;
+    let dev_y = stream.clone_htod(&host_y)?;
+    let mut dev_out: cudarc::driver::CudaSlice<f32> = stream.alloc_zeros::<f32>(N)?;
 
     let grid_x = ((N as u32) + (BLOCK as u32) - 1) / (BLOCK as u32);
     let cfg = LaunchConfig {
@@ -93,13 +92,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_dim: (4 * 32, 1, 1), // num_warps * 32
         shared_mem_bytes: 0,
     };
+    let n_arg: i32 = N as i32;
     unsafe {
-        func.launch(cfg, (&dev_x, &dev_y, &mut dev_out, N as i32))?;
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&dev_x)
+            .arg(&dev_y)
+            .arg(&mut dev_out)
+            .arg(&n_arg);
+        builder.launch(cfg)?;
     }
-    dev.synchronize()?;
+    stream.synchronize()?;
 
     // 7. Verify.
-    let host_out = dev.dtoh_sync_copy(&dev_out)?;
+    let host_out = stream.clone_dtoh(&dev_out)?;
     let mut max_err = 0.0f32;
     for i in 0..N {
         let want = host_x[i] + host_y[i];

@@ -34,12 +34,23 @@ bindgen = "0.70"
 cc = "1.0"
 cmake = "0.1"
 
-# CUDA runtime — `dynamic-linking` so `cargo check --features cuda` works
-# on Mac (no CUDA at build time). At runtime, libcuda.so is dlopened on
-# the GPU host; on hosts without CUDA, the dlopen fails with a clear
-# error. Phase 1 may switch to `cuda-version-from-build-system` for
-# release builds where static link is preferred.
-cudarc = { version = "0.13", default-features = false, features = ["std", "cuda-version-from-build-system", "driver"] }
+# CUDA runtime — bumped from 0.13 to 0.19 because 0.13.9 panics with
+# `Unsupported cuda toolkit version: 13.1` on CUDA 13 hosts.
+#
+# Feature picks (default-features off because the 0.19 default pulls in
+# cublas/curand/runtime which we don't need for kernel launch):
+#   `std`                          — pulls in std::error::Error impl on DriverError
+#                                    (needed so `?` works against Box<dyn Error>).
+#   `driver`                       — safe wrappers (CudaContext / Stream / launch_builder).
+#   `nvrtc`                        — exposes `cudarc::nvrtc::Ptx` (the type we use to
+#                                    pass PTX text into CudaContext::load_module).
+#   `dynamic-loading`              — dlopen libcuda at runtime, no link-time CUDA needed
+#                                    (so `cargo check --features cuda` works on Mac).
+#   `cuda-version-from-build-system` + `fallback-latest`
+#                                  — pick toolkit version via nvcc at build, fall back
+#                                    to the newest supported CUDA when nvcc is absent
+#                                    (Mac CI). Required to expose CUDA 13 APIs.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
 
 # Logging
 tracing = "0.1"
