@@ -87,7 +87,10 @@ pub fn decode_attention_typed<
 
     // ── tile loop over KV ──
     let kv_stride = num_kv_heads * head_dim;
-    let kv_blocks = valid_kv_len / (BLOCK_KV as i32);
+    // Ceil-div: any partial last tile is included; positions past
+    // valid_kv_len are masked out below (loads return 0 → scores get
+    // pushed to −∞ via the additive bias trick).
+    let kv_blocks = (valid_kv_len + (BLOCK_KV as i32) - 1) / (BLOCK_KV as i32);
 
     let (_, l_i, acc) = scf_for(
         const_i32(0),
@@ -97,6 +100,7 @@ pub fn decode_attention_typed<
         |kb, (m_i, l_i, acc)| {
             let pos_base = kb * (BLOCK_KV as i32);
             let pos_range = make_range(0, BLOCK_KV as i32) + pos_base;
+            let kv_pos_mask = pos_range < valid_kv_len; // [BLOCK_KV] i1
 
             // K block [BLOCK_KV, HEAD_DIM]: 2D pointer construction via
             // outer-add of `pos[i] * kv_stride + kv_head * head_dim` (rows)
@@ -107,12 +111,15 @@ pub fn decode_attention_typed<
             let col_2d = expand_dims(dim_range, 0); // [1, HEAD_DIM]
             let kv_off_2d = row_base_2d + col_2d; // [BLOCK_KV, HEAD_DIM]
 
-            // v0 simplification: caller pads valid_kv_len to a BLOCK_KV
-            // multiple AND head_dim==HEAD_DIM, so neither row nor col load
-            // can go OOB and we don't need a mask. (Real masking needs
-            // bitwise AND of two i1 tensors — DSL extension TODO.)
-            let k_block_t = load(k_cache + kv_off_2d);
-            let v_block_t = load(v_cache + kv_off_2d);
+            // 2D load mask: row-valid AND col-in-head_dim. Out-of-range
+            // lanes load 0 (Triton default `other`), which keeps the dot
+            // product finite; the score masking below pushes those rows
+            // to −∞ before softmax sees them.
+            let row_mask_2d = expand_dims(kv_pos_mask, 1); // [BLOCK_KV, 1]
+            let col_mask_2d = expand_dims(dim_mask, 0); // [1, HEAD_DIM]
+            let kv_load_mask = row_mask_2d & col_mask_2d; // [BLOCK_KV, HEAD_DIM]
+            let k_block_t = load(k_cache + kv_off_2d, kv_load_mask);
+            let v_block_t = load(v_cache + kv_off_2d, kv_load_mask);
             let k_block = to_f32(k_block_t); // [BLOCK_KV, HEAD_DIM] f32
             let v_block = to_f32(v_block_t);
 
@@ -120,7 +127,13 @@ pub fn decode_attention_typed<
             let q_2d = expand_dims(q_v, 0); // [1, HEAD_DIM]
             let qk = q_2d * k_block; // [BLOCK_KV, HEAD_DIM]
             let scores_raw = reduce(qk, 1, |a, b| a + b); // [BLOCK_KV]
-            let scores = scores_raw * scale;
+            let scores_unmasked = scores_raw * scale;
+            // Same flash_attn_full / unified_attention trick: add `(mask−1)*1e30`
+            // so masked positions land at −1e30 (effectively −∞ post-softmax).
+            // No `tt.where` / `arith.select` needed.
+            let mask_f = to_f32(kv_pos_mask);
+            let scores =
+                scores_unmasked + (mask_f - const_f32(1.0_f32)) * const_f32(1.0e30_f32);
 
             // online softmax
             let scores_max = reduce(scores, 0, |a, b| max(a, b)); // scalar
@@ -197,7 +210,9 @@ pub fn decode_attention_hm_typed<
     let l_init = const_f32(0.0_f32);
     let acc_init = q_v * 0.0_f32;
 
-    let kv_blocks = valid_kv_len / (BLOCK_KV as i32);
+    // Ceil-div + per-position masking handles arbitrary valid_kv_len
+    // (caller doesn't have to pad to a BLOCK_KV multiple).
+    let kv_blocks = (valid_kv_len + (BLOCK_KV as i32) - 1) / (BLOCK_KV as i32);
     // Head-major: each KV head's slab starts at kv_head * capacity * head_dim.
     let kv_head_base = kv_head * capacity * head_dim;
 
@@ -209,6 +224,7 @@ pub fn decode_attention_hm_typed<
         |kb, (m_i, l_i, acc)| {
             let pos_base = kb * (BLOCK_KV as i32);
             let pos_range = make_range(0, BLOCK_KV as i32) + pos_base;
+            let kv_pos_mask = pos_range < valid_kv_len; // [BLOCK_KV] i1
 
             // Head-major K/V address: kv_head_base + pos[i] * head_dim + d
             let row_base = pos_range * head_dim + kv_head_base;
@@ -216,15 +232,23 @@ pub fn decode_attention_hm_typed<
             let col_2d = expand_dims(dim_range, 0); // [1, HEAD_DIM]
             let kv_off_2d = row_base_2d + col_2d; // [BLOCK_KV, HEAD_DIM]
 
-            let k_block_t = load(k_cache + kv_off_2d);
-            let v_block_t = load(v_cache + kv_off_2d);
+            // 2D load mask: row-valid AND col-in-head_dim.
+            let row_mask_2d = expand_dims(kv_pos_mask, 1); // [BLOCK_KV, 1]
+            let col_mask_2d = expand_dims(dim_mask, 0); // [1, HEAD_DIM]
+            let kv_load_mask = row_mask_2d & col_mask_2d; // [BLOCK_KV, HEAD_DIM]
+            let k_block_t = load(k_cache + kv_off_2d, kv_load_mask);
+            let v_block_t = load(v_cache + kv_off_2d, kv_load_mask);
             let k_block = to_f32(k_block_t);
             let v_block = to_f32(v_block_t);
 
             let q_2d = expand_dims(q_v, 0);
             let qk = q_2d * k_block;
             let scores_raw = reduce(qk, 1, |a, b| a + b);
-            let scores = scores_raw * scale;
+            let scores_unmasked = scores_raw * scale;
+            // Push masked positions to −1e30 via additive bias.
+            let mask_f = to_f32(kv_pos_mask);
+            let scores =
+                scores_unmasked + (mask_f - const_f32(1.0_f32)) * const_f32(1.0e30_f32);
 
             let scores_max = reduce(scores, 0, |a, b| max(a, b));
             let m_ij = max(m_i, scores_max);
