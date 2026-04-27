@@ -236,7 +236,10 @@ static void build_llir_pipeline(
     pm.addPass(triton::gpu::createTritonGPUCombineTensorSelectAndIf());
     pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createConvertIndexToLLVMPass());
-    pm.addPass(triton::gpu::createAllocateSharedMemory());
+    // v3.6: NVIDIA-specific allocate-shared-memory replaces the generic
+    // TTGPU createAllocateSharedMemory. Sets `ttg.shared` (was
+    // `triton_gpu.shared` in v3.2) so the launcher knows shared_mem_bytes.
+    pm.addPass(triton::createAllocateSharedMemoryNvPass(capability, ptx_version));
     // v3.6: GlobalScratchAllocationPass populates the
     // `ttg.global_scratch_memory_size` / `..._alignment` module attrs.
     // The lowering pass below adds two extra implicit kernel args
@@ -508,11 +511,14 @@ TritonResult* triton_compile_mlir(
 
         // 7. Build metadata JSON (hand-formatted, no JSON lib).
         std::string name = extract_kernel_name(ptx);
-        // shared_mem from the module's "triton_gpu.shared" int attr (set
-        // by createAllocateSharedMemoryPass during the LLIR pipeline).
+        // shared_mem from the module's "ttg.shared" int attr (set by
+        // createAllocateSharedMemoryNvPass during the LLIR pipeline; was
+        // "triton_gpu.shared" in v3.2). Without this the launcher
+        // allocates 0 shared bytes and any kernel that writes to shared
+        // mem will trigger CUDA_ERROR_ILLEGAL_ADDRESS.
         int64_t shared_mem = 0;
         if (auto attr = module->getOperation()->getAttrOfType<mlir::IntegerAttr>(
-                "triton_gpu.shared")) {
+                "ttg.shared")) {
             shared_mem = attr.getInt();
         }
         // v3.6 implicit kernel args: scratch buffers the launcher must
