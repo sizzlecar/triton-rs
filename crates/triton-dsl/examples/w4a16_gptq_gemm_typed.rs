@@ -221,10 +221,19 @@ pub fn w4a16_gptq_gemm_typed<
         let group = k_base / group_size; // i32 scalar
 
         // qzeros[group, n/8] → [BN] i32. Then unpack with `(n % 8) * 4` shift.
+        // AutoGPTQ stores `qzero = actual_zero - 1` to leave room for one more
+        // value above 15 within int4 (a kind of asymmetric range trick).
+        // Recovering the real zero-point requires `+ 1` after the nibble
+        // extract — matches `crates/ferrum-kernels/src/backend/cpu.rs` and
+        // the GPTQ parity test in `gptq_parity_test.rs`. Without this offset
+        // the dequant is shifted by `1 * scale` per element, accumulating to
+        // visible NaN/Inf at long K.
         let qz_off_1d =
             splat_1d(group * stride_qzk, BN as i64) + qz_packed_col * stride_qzn; // [BN] i32
         let qz_packed = load(qzeros_ptr + qz_off_1d, mask_n); // [BN] i32
-        let zero_int4 = bit_and(shr_u_i32(qz_packed, qz_shifts_1d), f_mask_1d_bn); // [BN] i32
+        let zero_raw = bit_and(shr_u_i32(qz_packed, qz_shifts_1d), f_mask_1d_bn); // [BN] i32
+        let one_bn = splat_1d(const_i32(1), BN as i64);
+        let zero_int4 = zero_raw + one_bn; // [BN] i32 — actual_zero = stored + 1
 
         // scales[group, n] → [BN] T.
         let s_off_1d = splat_1d(group * stride_sk, BN as i64) + offs_n * stride_sn; // [BN] i32
