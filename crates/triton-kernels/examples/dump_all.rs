@@ -67,6 +67,10 @@ fn main() {
         // dump-only sanity check; real prefill runs use BLOCK_Q ≥ 32.
         "flash_attn_full_f32"               => flash_attn_full::<f32, 128, 1, 32>::mlir(),
         "flash_attn_full_f16"               => flash_attn_full::<f16, 128, 1, 32>::mlir(),
+        // Unified prefill + decode with paged KV (vLLM-style). HEAD_DIM=128
+        // (Llama / Qwen), BLOCK_Q=16 (works for both decode q_len=1 and
+        // small prefill tiles), BLOCK_KV=32. Real decode prefers BLOCK_Q=1.
+        "unified_attention_f32"             => unified_attention_f32::<128, 16, 32>::mlir(),
     ];
 
     match target {

@@ -124,6 +124,53 @@ fn flash_attn_full_f16_dtype_generic_distinct_from_f32() {
 }
 
 #[test]
+fn unified_attention_combines_paged_kv_block_table_with_causal_mask_loop() {
+    // vLLM-style unified prefill+decode: must show all three signature
+    // ingredients in one kernel — paged block-table gather, causal mask
+    // arithmetic, and an scf.for online-softmax loop carrying 3 iter_args.
+    let text = unified_attention_f32::<128, 16, 32>::mlir();
+    assert!(
+        text.contains("tt.func @unified_attention_f32("),
+        "missing kernel func:\n{text}"
+    );
+
+    // 3D grid: program_id(0)=seq_idx, (1)=q_head, (2)=q_tile_id.
+    assert!(
+        text.matches("\"tt.get_program_id\"").count() >= 3,
+        "expected ≥3 program_id calls (seq_idx + q_head + q_tile_id):\n{text}"
+    );
+
+    // Per-seq metadata loads: query_start_loc[seq] / query_start_loc[seq+1] /
+    // seq_lens[seq]. These are scalar i32 loads on i32 ptrs.
+    let header = &text[..text.find(") {").unwrap()];
+    assert!(
+        header.matches("!tt.ptr<i32>").count() >= 3,
+        "expected ≥3 i32 ptr params (block_table + seq_lens + query_start_loc):\n{header}"
+    );
+
+    // Block-table indirection: divsi (logical = kv_pos / block_size) +
+    // remsi (slot = kv_pos % block_size). Same as paged_decode kernel.
+    assert!(text.contains("\"arith.divsi\""));
+    assert!(text.contains("\"arith.remsi\""));
+
+    // Three-mask construction → andi chain. vLLM uses tl.where; we use
+    // bitwise-and on i1 then sitofp + score-arithmetic.
+    assert!(
+        text.matches("\"arith.andi\"").count() >= 2,
+        "expected ≥2 andi ops for combined causal & kv-bounds & query mask:\n{text}"
+    );
+    // Mask flattening to f32 score-arithmetic.
+    assert!(text.contains("\"arith.sitofp\""));
+
+    // Online softmax loop.
+    assert!(text.contains("\"scf.for\""));
+    assert!(text.contains("\"math.exp\""));
+
+    // Final 2D store.
+    assert!(text.contains("\"tt.store\""));
+}
+
+#[test]
 fn paged_decode_attention_emits_block_table_gather() {
     let text = paged_decode_attention_f32::<128, 32>::mlir();
     assert!(text.contains("tt.func @paged_decode_attention_f32("));

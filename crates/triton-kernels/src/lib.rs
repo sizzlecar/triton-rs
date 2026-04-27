@@ -69,7 +69,7 @@ pub mod prelude {
         batched_decode_attention_f32, batched_flash_decode_attn_phase1_f32,
         decode_attention_f32, decode_attention_hm_f32, flash_attn_full,
         flash_decode_attn_phase1_f32, flash_decode_attn_phase2_f32,
-        paged_decode_attention_f32,
+        paged_decode_attention_f32, unified_attention_f32,
     };
     // Dtype-generic markers re-exported from triton_ir.
     pub use triton_ir::ty::{f16, TritonElem};

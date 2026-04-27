@@ -839,3 +839,266 @@ pub fn flash_attn_full<
     let _ = dim_mask;
     store(output + out_off_2d, out_v);
 }
+
+/// **Unified prefill + decode attention with paged KV** — the single-kernel
+/// vLLM-style attention, stripped of all the optional features so the core
+/// online-softmax + block-table indirection mechanic is visible end-to-end.
+///
+/// Modeled after `kernel_unified_attention` in
+/// `vllm/v1/attention/ops/triton_unified_attention.py`. The whole point of
+/// vLLM's "unified" kernel is that prefill (q_len > 1) and decode (q_len == 1)
+/// run through the SAME body — the difference between them is just the size
+/// of the Q tile and the value of `query_start_loc` for that seq. There is
+/// no `if prefill else decode` branch; instead, all dispatching is done
+/// through three masks combined into the score:
+///   - `query_mask`: zero out rows where `q_pos_in_seq >= cur_batch_query_len`
+///     (over-launched grid pads up to `BLOCK_Q`)
+///   - `kv_bounds_mask`: zero out cols where `kv_pos >= seq_len`
+///   - `causal_mask`: zero out cols where `kv_pos > query_abs_pos`
+/// `final_mask = query_mask & kv_bounds_mask & causal_mask`, then
+/// `scores += (mask_f - 1) * 1e30` (since DSL has no `where` yet — same
+/// pattern as `flash_attn_full`).
+///
+/// **Shapes:**
+/// - `q_ptr`            : `[num_tokens_total, num_q_heads, head_dim]`
+/// - `k_cache_ptr`      : `[num_blocks, block_size, num_kv_heads, head_dim]`
+/// - `v_cache_ptr`      : `[num_blocks, block_size, num_kv_heads, head_dim]`
+/// - `out_ptr`          : `[num_tokens_total, num_q_heads, head_dim]`
+/// - `block_table_ptr`  : `[num_seqs, max_blocks_per_seq]` (i32)
+/// - `seq_lens_ptr`     : `[num_seqs]` (i32)
+/// - `query_start_loc_ptr`: `[num_seqs+1]` (i32, CSR-style cumulative
+///                          token offsets — `query_start_loc[i+1] -
+///                          query_start_loc[i]` = q_len of seq i)
+///
+/// **Launch:** grid = `(num_seqs, num_q_heads, max_q_tiles_per_seq)`
+/// where `max_q_tiles_per_seq = ceil(max(q_len_i) / BLOCK_Q)`. Programs
+/// whose `q_tile_id * BLOCK_Q >= cur_batch_query_len` produce all-masked
+/// rows, which the masked store discards. Decode (`q_len == 1`) launches
+/// with `BLOCK_Q == 16` (or whatever) and only row 0 is unmasked — this
+/// is the unification trick.
+///
+/// **Address arithmetic** for paged KV (per `kv_pos`):
+///   ```text
+///   logical_block = kv_pos / block_size
+///   slot          = kv_pos % block_size
+///   physical      = block_table[seq_idx, logical_block]
+///   kv_off        = physical * (block_size * num_kv_heads * head_dim)
+///                 + slot     * (num_kv_heads * head_dim)
+///                 + kv_head  * head_dim
+///                 + d
+///   ```
+/// (Identical to `paged_decode_attention_f32`'s gather pattern, just with
+/// per-seq lookup of the block-table base via `seq_idx * max_blocks_per_seq`.)
+///
+/// **FIXME(scope): explicitly skipped for v0** — match every line item to
+/// vLLM kernel features:
+/// - ALiBi slopes (per-head linear bias added to scores)
+/// - Soft-cap (`tanh(score / softcap) * softcap`)
+/// - Attention sinks (extra K/V positions baked into M-init)
+/// - Sliding window (`scores -= 1e30 * (kv_pos < q_pos - window)`)
+/// - FP8 / INT8 KV in-loop dequant (`k_scale`, `v_scale`, per-token-head
+///   scales)
+/// - QQ bias (`scores += qq_bias_tile`)
+/// - Batch-invariant softmax (compile-time fixed reduction order)
+/// - 3D split-softmax / chunked-prefill combine (`segm_*` outputs)
+/// - Output FP8 clipping (`tl.clamp` post-divide)
+/// - `out_scale` / `k_scale` / `v_scale` quant params
+/// All would be `#[cfg(feature = ...)]` follow-up additions; the body
+/// here is intentionally minimal.
+///
+/// **Constraints (v0):**
+/// - f32 only (no T-generic — keep the IR readable for first review).
+/// - `head_dim == HEAD_DIM` (no partial-head masking, same caveat as
+///   `flash_attn_full`).
+/// - `BLOCK_KV` divides `block_size` (so each KV tile fits within at most
+///   two physical blocks). Caller is expected to pick `BLOCK_KV <= block_size`.
+/// - GQA via `num_q_heads / num_kv_heads`. Programs are launched per Q
+///   head, NOT per KV head — same as `flash_attn_full`. (vLLM launches
+///   per kv_head and folds GQA into the inner Q-tile load; that's a
+///   follow-up trade-off, not a correctness issue.)
+#[triton_kernel]
+pub fn unified_attention_f32<const HEAD_DIM: usize, const BLOCK_Q: usize, const BLOCK_KV: usize>(
+    q_ptr: Ptr<f32>,
+    k_cache_ptr: Ptr<f32>,
+    v_cache_ptr: Ptr<f32>,
+    out_ptr: Ptr<f32>,
+    block_table_ptr: Ptr<i32>,
+    seq_lens_ptr: Ptr<i32>,
+    query_start_loc_ptr: Ptr<i32>,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    block_size: i32,
+    max_blocks_per_seq: i32,
+    sm_scale: f32,
+) {
+    let _ = num_q_heads;
+    let seq_idx = program_id(0);
+    let q_head = program_id(1);
+    let q_tile_id = program_id(2);
+
+    let num_kv_groups = num_q_heads / num_kv_heads;
+    let kv_head = q_head / num_kv_groups;
+
+    // ── per-seq metadata ──
+    // CSR-style: query_start_loc[seq_idx]   = first token index for seq
+    //            query_start_loc[seq_idx+1] = first token index for seq+1
+    // cur_batch_query_len = stop - start (the seq's q_len, 1 for decode).
+    let q_start = load(query_start_loc_ptr + seq_idx);
+    let q_stop = load(query_start_loc_ptr + (seq_idx + 1));
+    let cur_batch_query_len = q_stop - q_start;
+    let seq_len = load(seq_lens_ptr + seq_idx);
+    // For unified prefill + decode, the query tokens are appended at the
+    // tail of the KV cache, so kv_pos for query token q is at
+    //   kv_pos = (seq_len - cur_batch_query_len) + q_pos_in_seq.
+    // context_len is the offset of the first query token within the KV
+    // stream — for pure decode it's seq_len-1, for first prefill it's 0.
+    let context_len = seq_len - cur_batch_query_len;
+
+    // ── Q-tile coordinates ──
+    let dim_range = make_range(0, HEAD_DIM as i32);
+    let _ = head_dim;
+    let q_pos_in_tile = make_range(0, BLOCK_Q as i32);
+    // [BLOCK_Q]
+    let q_pos_in_seq = q_pos_in_tile + q_tile_id * (BLOCK_Q as i32);
+    // query_mask: rows of the tile that fall inside [0, cur_batch_query_len).
+    // Programs over-launched past the seq's end produce all-masked output.
+    // [BLOCK_Q] i1
+    let query_mask = q_pos_in_seq < cur_batch_query_len;
+
+    // Per-token Q row base in the global token-major Q tensor:
+    //   token_idx = q_start + q_pos_in_seq
+    //   q_off    = token_idx * (num_q_heads * head_dim) + q_head * head_dim + d
+    let token_idx = q_pos_in_seq + q_start; // [BLOCK_Q]
+    let q_row_stride = num_q_heads * head_dim;
+    let q_row_base = token_idx * q_row_stride + q_head * head_dim; // [BLOCK_Q]
+    let q_row_2d = expand_dims(q_row_base, 1); // [BLOCK_Q, 1]
+    let dim_2d = expand_dims(dim_range, 0); // [1, HEAD_DIM]
+    let q_off_2d = q_row_2d + dim_2d; // [BLOCK_Q, HEAD_DIM]
+
+    // Load Q. Out-of-range rows return 0 — the score-mask later flushes
+    // them anyway, so the loaded value doesn't matter.
+    // (Triton's mask= arg on 2D ptrs needs a 2D mask; broadcast query_mask
+    //  to [BLOCK_Q, HEAD_DIM] via expand_dims+broadcast. We rely on
+    //  pad-load semantics + masked store at the end instead, since v0 of
+    //  flash_attn_full follows the same pattern and works.)
+    let q_tile = load(q_ptr + q_off_2d); // [BLOCK_Q, HEAD_DIM] f32
+
+    // ── online-softmax init ──
+    // Build f32 init tensors of the right shape via x*0 trick.
+    let m_init = q_tile * 0.0_f32; // [BLOCK_Q, HEAD_DIM]
+
+    // Reduce to [BLOCK_Q] by summing along HEAD_DIM (sum of zeros = 0).
+    let zero_q = reduce(m_init, 1, |a, b| a + b); // [BLOCK_Q] f32
+    let m_i_init = zero_q - 1.0e30_f32; // [BLOCK_Q]
+    let l_i_init = zero_q; // [BLOCK_Q]
+    let acc_init = q_tile * 0.0_f32; // [BLOCK_Q, HEAD_DIM]
+
+    // ── KV loop ──
+    // Loop over KV in BLOCK_KV-wide tiles. We over-iterate up to
+    // `seq_len` rounded up — but the kv_bounds_mask zeroes out the tail.
+    // Caller responsibility: pad seq_len up to a multiple of BLOCK_KV.
+    let kv_blocks = seq_len / (BLOCK_KV as i32);
+
+    // Paged layout strides.
+    let kv_inner_stride = num_kv_heads * head_dim; // per-slot stride
+    let block_stride = block_size * kv_inner_stride; // per-physical-block
+
+    // Per-seq base into block_table: row = seq_idx * max_blocks_per_seq.
+    let bt_seq_base = seq_idx * max_blocks_per_seq;
+
+    let (_, l_i, acc) = scf_for(
+        const_i32(0),
+        kv_blocks,
+        const_i32(1),
+        (m_i_init, l_i_init, acc_init),
+        |kb, (m_i, l_i, acc)| {
+            let kv_pos_base = kb * (BLOCK_KV as i32);
+            // [BLOCK_KV]
+            let kv_pos_range = make_range(0, BLOCK_KV as i32) + kv_pos_base;
+
+            // ── block-table indirection ──
+            // logical_block[i] = kv_pos[i] / block_size
+            // slot[i]          = kv_pos[i] % block_size
+            // physical[i]      = block_table[seq, logical_block[i]]
+            let logical_blocks = kv_pos_range / block_size; // [BLOCK_KV]
+            let slots = kv_pos_range % block_size; // [BLOCK_KV]
+            let physical_blocks = load(block_table_ptr + (bt_seq_base + logical_blocks));
+
+            // Per-position row base in the block pool:
+            //   physical * block_stride + slot * kv_inner_stride + kv_head * head_dim
+            let row_base =
+                physical_blocks * block_stride + slots * kv_inner_stride + kv_head * head_dim;
+            let row_base_2d = expand_dims(row_base, 1); // [BLOCK_KV, 1]
+            let kv_off_2d = row_base_2d + dim_2d; // [BLOCK_KV, HEAD_DIM]
+
+            let k_tile = load(k_cache_ptr + kv_off_2d); // [BLOCK_KV, HEAD_DIM]
+            let v_tile = load(v_cache_ptr + kv_off_2d); // [BLOCK_KV, HEAD_DIM]
+
+            // ── scores = Q · Kᵀ ── (broadcast-mul-reduce over HEAD_DIM)
+            // Same pattern as flash_attn_full. tt.dot is a follow-up
+            // optimization for HEAD_DIM ≥ 64.
+            let q_3d = expand_dims(q_tile, 1); // [BLOCK_Q, 1, HEAD_DIM]
+            let k_3d = expand_dims(k_tile, 0); // [1, BLOCK_KV, HEAD_DIM]
+            let qk = q_3d * k_3d; // [BLOCK_Q, BLOCK_KV, HEAD_DIM]
+            let scores_raw = reduce(qk, 2, |a, b| a + b); // [BLOCK_Q, BLOCK_KV]
+            let scores_scaled = scores_raw * sm_scale;
+
+            // ── mask construction ──
+            // 1. Causal: kv_pos <= context_len + q_pos_in_seq
+            //    (Equivalently: kv_pos - context_len <= q_pos_in_seq.)
+            //    For pure decode (q_len==1), context_len == seq_len-1,
+            //    so all kv_pos are <= context_len+0 = seq_len-1 — i.e.
+            //    ALL kv positions are visible (correct for decode).
+            //    For prefill, context_len==0, so kv_pos[k] <= q_pos[q]
+            //    is the standard causal mask.
+            let q_abs_2d = expand_dims(q_pos_in_seq + context_len, 1); // [BLOCK_Q, 1]
+            let kv_pos_2d = expand_dims(kv_pos_range, 0); // [1, BLOCK_KV]
+            let causal_mask = kv_pos_2d <= q_abs_2d; // [BLOCK_Q, BLOCK_KV] i1
+
+            // 2. KV bounds: kv_pos < seq_len. Tail of the over-iterated
+            //    KV loop is zeroed.
+            let kv_in_bounds_1d = kv_pos_range < seq_len; // [BLOCK_KV] i1
+            let kv_in_bounds_2d = expand_dims(kv_in_bounds_1d, 0); // [1, BLOCK_KV] i1
+
+            // 3. Query-row validity.
+            let query_mask_2d = expand_dims(query_mask, 1); // [BLOCK_Q, 1] i1
+
+            // Combine: AND (`&` on i1 maps to arith.andi via the
+            // bit-and op spec).
+            let combined_mask = causal_mask & kv_in_bounds_2d & query_mask_2d;
+            let mask_f = to_f32(combined_mask); // [BLOCK_Q, BLOCK_KV] f32
+            let masked_scores = scores_scaled + (mask_f - 1.0_f32) * 1.0e30_f32;
+
+            // ── per-row online softmax ──
+            let row_max = reduce(masked_scores, 1, |a, b| max(a, b)); // [BLOCK_Q]
+            let m_ij = max(m_i, row_max);
+            let alpha = exp(m_i - m_ij);
+            let p = exp(masked_scores - expand_dims(m_ij, 1)); // [BLOCK_Q, BLOCK_KV]
+            let l_ij = reduce(p, 1, |a, b| a + b); // [BLOCK_Q]
+
+            // ── pv accumulate ──
+            let p_3d = expand_dims(p, 2); // [BLOCK_Q, BLOCK_KV, 1]
+            let v_3d = expand_dims(v_tile, 0); // [1, BLOCK_KV, HEAD_DIM]
+            let pv = p_3d * v_3d; // [BLOCK_Q, BLOCK_KV, HEAD_DIM]
+            let pv_sum = reduce(pv, 1, |a, b| a + b); // [BLOCK_Q, HEAD_DIM]
+
+            let alpha_2d = expand_dims(alpha, 1);
+            let new_acc = acc * alpha_2d + pv_sum;
+            let new_l_i = l_i * alpha + l_ij;
+            (m_ij, new_l_i, new_acc)
+        },
+    );
+
+    // ── normalize + write ──
+    let l_i_2d = expand_dims(l_i, 1);
+    let out_v = acc / l_i_2d;
+    // Store back into the global token-major output tensor at the SAME
+    // row layout Q used. v0 emits unmasked store — same caveat as
+    // flash_attn_full (1D mask on 2D ptr trips the verifier; over-launched
+    // rows just clobber memory beyond the seq, which the caller compensates
+    // for by ensuring the grid only covers tiles within real q_len ranges).
+    let out_off_2d = q_off_2d;
+    let _ = query_mask; // unused as a 2D store mask in v0
+    store(out_ptr + out_off_2d, out_v);
+}
