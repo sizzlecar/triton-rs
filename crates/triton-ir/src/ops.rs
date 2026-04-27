@@ -172,3 +172,49 @@ pub fn eq(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
 pub fn ne(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
     cmp(f, CmpiPred::Ne, CmpfPred::One, a, b)
 }
+
+// ── bitwise / shift ─────────────────────────────────────────────────────
+//
+// Only integers are meaningful operands. Floats and pointers panic.
+
+fn require_int(name: &str, a: &Value) {
+    if is_float(a.ty()) {
+        panic!("ops::{name} on float types is not meaningful; got {}", a.ty());
+    }
+    if is_ptr_like(a.ty()) {
+        panic!("ops::{name} on pointer types is not meaningful; got {}", a.ty());
+    }
+}
+
+/// `a & b` — bitwise AND (integer).
+pub fn and(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    require_int("and", &a);
+    f.op_one(arith::andi(a, b))
+}
+
+/// `a | b` — bitwise OR.
+pub fn or(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    require_int("or", &a);
+    f.op_one(arith::ori(a, b))
+}
+
+/// `a ^ b` — bitwise XOR.
+pub fn xor(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    require_int("xor", &a);
+    f.op_one(arith::xori(a, b))
+}
+
+/// `a << b` — shift left.
+pub fn shl(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    require_int("shl", &a);
+    f.op_one(arith::shli(a, b))
+}
+
+/// `a >> b` — arithmetic (sign-extending) shift right. Matches Rust's
+/// `>>` semantics on signed integers; for logical shift right (unsigned
+/// extraction such as quant nibble unpack), use the explicit
+/// `shr_u_i32(a, b)` named call from the DSL.
+pub fn shr(f: &mut FuncBuilder<'_>, a: Value, b: Value) -> Value {
+    require_int("shr", &a);
+    f.op_one(arith::shrsi(a, b))
+}

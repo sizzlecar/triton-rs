@@ -103,6 +103,88 @@ pub fn remui(lhs: Value, rhs: Value) -> OpSpec {
         .with_result(ty)
 }
 
+/// `arith.divui` — unsigned integer divide. Used when group counts /
+/// strides are guaranteed non-negative (e.g. quant unpack indexing).
+pub fn divui(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.divui")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+// ── bitwise / shift (integer-only) ──────────────────────────────────────
+//
+// These unblock packed-int unpack patterns common to quantization kernels:
+// GPTQ `(packed >> 4*i) & 0xF`, AWQ `(packed >> shift) & 0xFFFF`, FP8
+// pack/unpack, mask synthesis, etc. Float operands are nonsensical for
+// these ops; the IR builder should reject them at the dispatcher layer.
+
+/// `arith.andi` — bitwise AND. Result type follows `lhs`.
+pub fn andi(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.andi")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.ori` — bitwise OR.
+pub fn ori(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.ori")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.xori` — bitwise XOR.
+pub fn xori(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.xori")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.shli` — shift left (integer; shift amount in `rhs`).
+pub fn shli(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.shli")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.shrsi` — arithmetic (sign-extending) shift right.
+/// Matches Rust's `>>` on signed integers.
+pub fn shrsi(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.shrsi")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.shrui` — logical (zero-extending) shift right.
+/// Use for unsigned bit-field extraction such as quant nibble unpack.
+pub fn shrui(lhs: Value, rhs: Value) -> OpSpec {
+    let ty = lhs.ty().clone();
+    OpSpec::new("arith.shrui")
+        .with_operand(lhs)
+        .with_operand(rhs)
+        .with_result(ty)
+}
+
+/// `arith.extui` — zero-extend a smaller integer to a wider one (i32 → i64
+/// without sign extension). Companion to [`extsi`] for unsigned widening,
+/// which packed-int unpacking often needs after the masking step.
+pub fn extui(x: Value, target: Type) -> OpSpec {
+    OpSpec::new("arith.extui")
+        .with_operand(x)
+        .with_result(target)
+}
+
 /// `arith.maximumf` — element-wise float max (NaN-propagating). Use this
 /// for softmax's row-max pass and similar reductions. The `_num` variant
 /// (`maxnumf`) treats NaN as a missing value and prefers non-NaN; we
