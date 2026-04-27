@@ -559,12 +559,17 @@ fn binop_method(op: &BinOp, span: &Span) -> Result<proc_macro2::Ident, syn::Erro
         BinOp::Ge(_) => "ge",
         BinOp::Eq(_) => "eq",
         BinOp::Ne(_) => "ne",
+        BinOp::BitAnd(_) => "and",
+        BinOp::BitOr(_) => "or",
+        BinOp::BitXor(_) => "xor",
+        BinOp::Shl(_) => "shl",
+        BinOp::Shr(_) => "shr",
         other => {
             return Err(syn::Error::new(
                 *span,
                 format!(
                     "binary operator `{:?}` is not supported in #[triton_kernel] body \
-                     (supported: `+ - * / % < <= > >= == !=`)",
+                     (supported: `+ - * / % < <= > >= == != & | ^ << >>`)",
                     other
                 ),
             ));
@@ -1399,6 +1404,40 @@ fn op_spec_for(
 
         "const_i32" | "const_i64" | "const_f32" => return Err(arity_err("1")),
 
+        // ── bitwise / shift (integer-only) ──
+        // Type-generic wrapper goes through ops::{and,or,xor,shl,shr} which
+        // panic if the operand is float/pointer. Same as `+` / `-` etc.
+        "bit_and" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::andi(#(#args),*) },
+        ),
+        "bit_or" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::ori(#(#args),*) },
+        ),
+        "bit_xor" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::xori(#(#args),*) },
+        ),
+        "shl_i32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::shli(#(#args),*) },
+        ),
+        // Arithmetic right shift (signed; preserves sign bit). Matches `>>`.
+        "shr_s_i32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::shrsi(#(#args),*) },
+        ),
+        // Logical right shift (unsigned; zero-fill). Use this for packed
+        // nibble / FP8 / INT8 unpack from int32 carriers.
+        "shr_u_i32" if n == 2 => (
+            CallKind::Value,
+            quote! { ::triton_ir::dialect::arith::shrui(#(#args),*) },
+        ),
+        "bit_and" | "bit_or" | "bit_xor" | "shl_i32" | "shr_s_i32" | "shr_u_i32" => {
+            return Err(arity_err("2"))
+        }
+
         other => {
             return Err(syn::Error::new(
                 call_span,
@@ -1410,7 +1449,8 @@ fn op_spec_for(
                      dot, broadcast_2d, expand_dims, reshape_2d, \
                      const_i32, const_i64, const_f32, \
                      add_i32, sub_i32, mul_i32, add_f32, mul_f32, \
-                     lt_i32, le_i32, eq_i32",
+                     lt_i32, le_i32, eq_i32, \
+                     bit_and, bit_or, bit_xor, shl_i32, shr_s_i32, shr_u_i32",
                     other
                 ),
             ));

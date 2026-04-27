@@ -535,6 +535,40 @@ impl<'m> FuncBuilder<'m> {
         crate::ops::ne(self, a, b)
     }
 
+    // ── bitwise / shift ────────────────────────────────────────────────
+    //
+    // Integer-only. Each method panics if the operand element type is a
+    // float or pointer. `shr` is arithmetic (sign-extending); for logical
+    // shift right on packed quant words call `crate::ops::arith::shrui`
+    // directly via the DSL's `shr_u_i32` named call.
+
+    /// `a & b` — bitwise AND. See [`crate::ops::and`].
+    pub fn and(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
+        crate::ops::and(self, a, b)
+    }
+    /// `a | b` — bitwise OR. See [`crate::ops::or`].
+    pub fn or(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
+        crate::ops::or(self, a, b)
+    }
+    /// `a ^ b` — bitwise XOR. See [`crate::ops::xor`].
+    pub fn xor(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
+        crate::ops::xor(self, a, b)
+    }
+    /// `a << b` — shift left. See [`crate::ops::shl`].
+    pub fn shl(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
+        crate::ops::shl(self, a, b)
+    }
+    /// `a >> b` — arithmetic (sign-extending) shift right.
+    /// See [`crate::ops::shr`].
+    pub fn shr(&mut self, a: Value, b: Value) -> Value {
+        let (a, b) = self.coerce_elemwise(a, b);
+        crate::ops::shr(self, a, b)
+    }
+
     /// Build a Value from a Rust integer literal that matches `sample`'s
     /// element type. Used by the DSL's auto-promotion: when the proc-macro
     /// sees `pid * 1024`, it lifts the literal to a Value via this helper
