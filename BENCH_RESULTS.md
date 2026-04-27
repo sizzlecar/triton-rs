@@ -1,25 +1,27 @@
 # Bench Results — triton-rs DSL vs Python @triton.jit vs ferrum hand-.cu
 
 **Hardware:** RTX 5070 Ti (Blackwell consumer, sm_120 native, PTX targets sm_89), Vast.ai
-**Toolchain:** Triton v3.2.0 vendored; LLVM-86b69c31 prebuilt; ptxas from CUDA 12.8
-**Status:** Phase 1 done — Rust C ABI shim drives Triton's MLIR pass pipeline directly. Zero Python in compile or runtime path.
-**Date:** 2026-04-26
+**Toolchain:** Triton v3.6.0 vendored; LLVM-f6ded0be prebuilt; ptxas from CUDA 12.8
+**Status:** Phase 1 done — Rust C ABI shim drives Triton's MLIR pass pipeline directly. Zero Python in compile or runtime path. v3.6 bump landed — launchers updated to pass v3.6's two implicit kernel args (global_scratch + profile_scratch).
+**Date:** 2026-04-27
 
 All three sources go through identical launchers (`cudarc` + CUDA events as the timer) and identical buffer sizes. Rust shim path = `cargo run -p triton-sys --features compile-triton --example compile_mlir`; the Python fallback (`tools/mlir_to_cubin.py`) stays available via `USE_PYTHON_COMPILE=1` for differential testing.
 
-## residual_add_f32 — `out[i] = a[i] + b[i]`
+The Python @triton.jit column is still measured against PyPI's `triton==3.2.0` (the box's pre-installed version) — the cross-version comparison stays clean because both the v3.6 Rust shim and v3.2 Python emit the same PTX shape on memory-bound kernels.
+
+## residual_add_f32 — `out[i] = a[i] + b[i]`  *(re-measured on v3.6 2026-04-27)*
 
 ```
 N = 33554432 elements (134 MB per buffer, 402.7 MB touched per call)
 iters = 200 (after 20 warmup)
 
 source                  us / call   GB/s eff.     % peak  grid×block
-triton-rs DSL               510.2       789.1      88.1%  32768×128
-ferrum .cu (nvcc)           509.7       789.9      88.2%  131072×256
-Python @triton.jit          510.3       789.0      88.1%  32768×128
+triton-rs DSL (v3.6)        510.9       788.2      88.0%  32768×128
+ferrum .cu (nvcc)           509.8       789.9      88.2%  131072×256
+Python @triton.jit (v3.2)   510.4       788.9      88.0%  32768×128
 ```
 
-**Result:** Rust shim ≡ Python ≡ ferrum within timer noise. All hit 88% of theoretical DRAM peak (~896 GB/s on this card). Memory-bound kernel; compiler version effectively doesn't matter.
+**Result:** Rust shim ≡ Python ≡ ferrum within timer noise. All hit 88% of theoretical DRAM peak (~896 GB/s on this card). Memory-bound kernel; compiler version (v3.2 vs v3.6) effectively doesn't matter. Sanity err = 0.
 
 ## fused_silu_mul_f32 — `out[i] = silu(gate[i]) * up[i]`
 
@@ -33,7 +35,7 @@ ferrum .cu (nvcc)           509.9       789.7      88.1%  131072×256
 Python @triton.jit          510.5       788.8      88.0%  32768×128
 ```
 
-**Result:** Rust shim ≡ Python ≡ ferrum within timer noise. All hit 88% of theoretical DRAM peak. Sanity err = 2.3e-10 (float rounding).
+**Result:** Rust shim ≡ Python ≡ ferrum within timer noise. All hit 88% of theoretical DRAM peak. Sanity err = 2.3e-10 (float rounding). *(numbers from v3.2; not re-run on v3.6 — same hot path, expected to match.)*
 
 ## rms_norm_f32 — row-block reduction + reciprocal sqrt
 
@@ -47,7 +49,7 @@ ferrum .cu (nvcc)           550.4       487.7      54.4%  32768×1024
 Python @triton.jit          349.4       768.3      85.7%  32768×128
 ```
 
-**Result:** Rust shim ≡ Python (slightly faster on this run — within noise) and **1.58x faster than ferrum's hand-written .cu**. Triton's autovectorization wins; the thin Rust DSL inherits all of it. Sanity err = 0.
+**Result:** Rust shim ≡ Python (slightly faster on this run — within noise) and **1.58x faster than ferrum's hand-written .cu**. Triton's autovectorization wins; the thin Rust DSL inherits all of it. Sanity err = 0. *(numbers from v3.2; not re-run on v3.6 — same hot path, expected to match.)*
 
 ## Takeaways
 
