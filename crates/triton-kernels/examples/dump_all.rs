@@ -1,13 +1,19 @@
-//! `cargo run --example dump_all -p triton-kernels [-- KERNEL]`
+//! `cargo run --example dump_all -p triton-kernels [-- KERNEL [DTYPE]]`
 //!
 //! Dumps the MLIR for one or more shipped kernels, useful for piping
 //! into `tools/mlir_to_cubin.py` to verify each compiles through Triton
 //! end-to-end. Without an argument lists all known kernels.
+//!
+//! For the dtype-generic decode-attention kernels
+//! (`decode_attention_typed`, `decode_attention_hm_typed`,
+//! `paged_decode_attention_typed`) you can pass an optional second arg
+//! `f32` (default) / `f16` / `bf16` to choose the instantiation.
 
 use triton_kernels::prelude::*;
 
 fn main() {
     let target: Option<String> = std::env::args().nth(1);
+    let dtype: String = std::env::args().nth(2).unwrap_or_else(|| "f32".into());
 
     macro_rules! all_kernels {
         ($($name:literal => $emit:expr),* $(,)?) => {{
@@ -15,6 +21,21 @@ fn main() {
             kernels
         }};
     }
+
+    // Dtype-aware shortcut: for `decode_attention_typed` and friends we
+    // dispatch through here so a CLI second-arg can pick the dtype
+    // instantiation (matches the per-kernel `ferrum_*` example pattern).
+    let dtype_kernel = |name: &str| -> Option<String> {
+        match (name, dtype.as_str()) {
+            ("decode_attention_typed", "f32") => Some(decode_attention_typed::<f32, 128, 32>::mlir()),
+            ("decode_attention_typed", "f16") => Some(decode_attention_typed::<f16, 128, 32>::mlir()),
+            ("decode_attention_hm_typed", "f32") => Some(decode_attention_hm_typed::<f32, 128, 32>::mlir()),
+            ("decode_attention_hm_typed", "f16") => Some(decode_attention_hm_typed::<f16, 128, 32>::mlir()),
+            ("paged_decode_attention_typed", "f32") => Some(paged_decode_attention_typed::<f32, 128, 32>::mlir()),
+            ("paged_decode_attention_typed", "f16") => Some(paged_decode_attention_typed::<f16, 128, 32>::mlir()),
+            _ => None,
+        }
+    };
 
     let kernels = all_kernels![
         "vec_add_f32"                       => vec_add_f32::<1024>::mlir(),
@@ -36,10 +57,14 @@ fn main() {
         "split_qkv_f32"                     => split_qkv_f32::<128>::mlir(),
         "transpose_head_to_token_f32"       => transpose_head_to_token_f32::<128>::mlir(),
         // HEAD_DIM=128 (typical Llama / Qwen size), BLOCK_KV=32 tile.
-        "decode_attention_f32"              => decode_attention_f32::<128, 32>::mlir(),
-        "decode_attention_hm_f32"           => decode_attention_hm_f32::<128, 32>::mlir(),
+        // decode_attention_typed / decode_attention_hm_typed /
+        // paged_decode_attention_typed are dtype-generic — the listed
+        // names below default to f32 (use the CLI second arg to pick
+        // f16 / bf16). Listed here so they show up in the kernel index.
+        "decode_attention_typed"            => decode_attention_typed::<f32, 128, 32>::mlir(),
+        "decode_attention_hm_typed"         => decode_attention_hm_typed::<f32, 128, 32>::mlir(),
         "batched_decode_attention_f32"      => batched_decode_attention_f32::<128, 32>::mlir(),
-        "paged_decode_attention_f32"        => paged_decode_attention_f32::<128, 32>::mlir(),
+        "paged_decode_attention_typed"      => paged_decode_attention_typed::<f32, 128, 32>::mlir(),
         // f16 variants — ferrum's production path uses f16. Reduce ops
         // upcast to f32 internally to match Python Triton's accuracy.
         "vec_add_f16"                       => vec_add_f16::<1024>::mlir(),
@@ -75,6 +100,12 @@ fn main() {
 
     match target {
         Some(name) => {
+            // Dtype-aware kernels first (their default-table entry is f32;
+            // the CLI's optional second arg picks the actual instantiation).
+            if let Some(mlir) = dtype_kernel(&name) {
+                print!("{}", mlir);
+                return;
+            }
             for (n, emit) in kernels {
                 if *n == name {
                     print!("{}", emit());

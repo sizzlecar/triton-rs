@@ -67,9 +67,9 @@ pub mod prelude {
     pub use crate::reduction::{cross_entropy_forward_f32, softmax_f16, softmax_f32};
     pub use crate::attention::{
         batched_decode_attention_f32, batched_flash_decode_attn_phase1_f32,
-        decode_attention_f32, decode_attention_hm_f32, flash_attn_full,
-        flash_decode_attn_phase1_f32, flash_decode_attn_phase2_f32,
-        paged_decode_attention_f32, unified_attention_f32,
+        decode_attention_hm_typed, decode_attention_typed,
+        flash_attn_full, flash_decode_attn_phase1_f32, flash_decode_attn_phase2_f32,
+        paged_decode_attention_typed, unified_attention_f32,
     };
     // Dtype-generic markers re-exported from triton_ir.
     pub use triton_ir::ty::{f16, TritonElem};

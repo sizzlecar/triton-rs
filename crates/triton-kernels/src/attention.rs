@@ -39,12 +39,24 @@ struct Ptr<T>(::std::marker::PhantomData<T>);
 /// `[BLOCK_KV, HEAD_DIM]` — slower for huge head dims but matches ferrum's
 /// access pattern and is easier to verify. Switch to `tt.dot` once we've
 /// validated correctness.
+///
+/// **Internal compute is f32 regardless of T.** Q/K/V are loaded at T's
+/// element type then upcast via `to_f32`; m_i / l_i / acc / scores all
+/// run in f32 throughout the loop; the final accumulator is downcast
+/// back to T via `as_t::<T>(out_v)` at the store boundary. This is
+/// required for f16 because NVPTX has no native f16 division or
+/// `math.exp` instructions, and matches Python @triton.jit's strategy
+/// for mixed-precision attention.
 #[triton_kernel]
-pub fn decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
-    q: Ptr<f32>,
-    k_cache: Ptr<f32>,
-    v_cache: Ptr<f32>,
-    output: Ptr<f32>,
+pub fn decode_attention_typed<
+    T: TritonElem,
+    const HEAD_DIM: usize,
+    const BLOCK_KV: usize,
+>(
+    q: Ptr<T>,
+    k_cache: Ptr<T>,
+    v_cache: Ptr<T>,
+    output: Ptr<T>,
     num_q_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -60,7 +72,8 @@ pub fn decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
     let dim_range = make_range(0, HEAD_DIM as i32);
     let dim_mask = dim_range < head_dim;
     let q_off = q_head * head_dim + dim_range;
-    let q_v = load(q + q_off, dim_mask);
+    let q_v_t = load(q + q_off, dim_mask);
+    let q_v = to_f32(q_v_t); // [HEAD_DIM] f32
 
     // ── online-softmax state ──
     // Negative-float literals aren't accepted directly by the DSL macro;
@@ -68,7 +81,8 @@ pub fn decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
     let m_init = const_f32(0.0_f32) - const_f32(1.0e30_f32);
     let l_init = const_f32(0.0_f32);
     // acc starts at zero across HEAD_DIM. Use Q*0 so we get a tensor of the
-    // right shape without a dedicated zeros-tensor builder.
+    // right shape without a dedicated zeros-tensor builder. q_v is already
+    // f32, so the resulting init tensor is f32 regardless of T.
     let acc_init = q_v * 0.0_f32;
 
     // ── tile loop over KV ──
@@ -97,8 +111,10 @@ pub fn decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
             // multiple AND head_dim==HEAD_DIM, so neither row nor col load
             // can go OOB and we don't need a mask. (Real masking needs
             // bitwise AND of two i1 tensors — DSL extension TODO.)
-            let k_block = load(k_cache + kv_off_2d);
-            let v_block = load(v_cache + kv_off_2d);
+            let k_block_t = load(k_cache + kv_off_2d);
+            let v_block_t = load(v_cache + kv_off_2d);
+            let k_block = to_f32(k_block_t); // [BLOCK_KV, HEAD_DIM] f32
+            let v_block = to_f32(v_block_t);
 
             // scores[BLOCK_KV] = sum_d Q[d] * K[i, d]
             let q_2d = expand_dims(q_v, 0); // [1, HEAD_DIM]
@@ -125,12 +141,16 @@ pub fn decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
     );
 
     // ── normalize + write back ──
-    let out_v = acc / l_i;
+    // out_v_f32 stays in f32 (acc and l_i are f32). Downcast to T via
+    // as_t::<T>(...) so the store matches the output pointer's element
+    // type. For T == f32 the cast is a no-op.
+    let out_v_f32 = acc / l_i;
+    let out_v = as_t::<T>(out_v_f32);
     let out_off = q_head * head_dim + dim_range;
     store(output + out_off, out_v, dim_mask);
 }
 
-/// Same online-softmax decode attention as [`decode_attention_f32`] but
+/// Same online-softmax decode attention as [`decode_attention_typed`] but
 /// for the **head-major** KV-cache layout `[num_kv_heads, capacity, head_dim]`
 /// (used by ferrum's LlamaFamilyModel decode path after
 /// `kv_cache_append_head_major_*`). Q and output stay
@@ -142,12 +162,19 @@ pub fn decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
 ///
 /// `capacity` is the allocated slot count (allocated_kv_slots), which may
 /// be > `valid_kv_len`; the kernel only reads `valid_kv_len` positions.
+///
+/// **Internal compute is f32 regardless of T** — see [`decode_attention_typed`]
+/// rationale (NVPTX has no native f16 div / exp).
 #[triton_kernel]
-pub fn decode_attention_hm_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
-    q: Ptr<f32>,
-    k_cache: Ptr<f32>,
-    v_cache: Ptr<f32>,
-    output: Ptr<f32>,
+pub fn decode_attention_hm_typed<
+    T: TritonElem,
+    const HEAD_DIM: usize,
+    const BLOCK_KV: usize,
+>(
+    q: Ptr<T>,
+    k_cache: Ptr<T>,
+    v_cache: Ptr<T>,
+    output: Ptr<T>,
     num_q_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -163,7 +190,8 @@ pub fn decode_attention_hm_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
     let dim_range = make_range(0, HEAD_DIM as i32);
     let dim_mask = dim_range < head_dim;
     let q_off = q_head * head_dim + dim_range;
-    let q_v = load(q + q_off, dim_mask);
+    let q_v_t = load(q + q_off, dim_mask);
+    let q_v = to_f32(q_v_t); // [HEAD_DIM] f32
 
     let m_init = const_f32(0.0_f32) - const_f32(1.0e30_f32);
     let l_init = const_f32(0.0_f32);
@@ -188,8 +216,10 @@ pub fn decode_attention_hm_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
             let col_2d = expand_dims(dim_range, 0); // [1, HEAD_DIM]
             let kv_off_2d = row_base_2d + col_2d; // [BLOCK_KV, HEAD_DIM]
 
-            let k_block = load(k_cache + kv_off_2d);
-            let v_block = load(v_cache + kv_off_2d);
+            let k_block_t = load(k_cache + kv_off_2d);
+            let v_block_t = load(v_cache + kv_off_2d);
+            let k_block = to_f32(k_block_t);
+            let v_block = to_f32(v_block_t);
 
             let q_2d = expand_dims(q_v, 0);
             let qk = q_2d * k_block;
@@ -212,7 +242,8 @@ pub fn decode_attention_hm_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
         },
     );
 
-    let out_v = acc / l_i;
+    let out_v_f32 = acc / l_i;
+    let out_v = as_t::<T>(out_v_f32);
     let out_off = q_head * head_dim + dim_range;
     store(output + out_off, out_v, dim_mask);
 }
@@ -335,13 +366,22 @@ pub fn batched_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize
 ///
 /// Used by ferrum's PagedAttention path. v0 still assumes
 /// `valid_kv_len % BLOCK_KV == 0` and `head_dim == HEAD_DIM`.
+///
+/// **Internal compute is f32 regardless of T** — see [`decode_attention_typed`]
+/// rationale (NVPTX has no native f16 div / exp). The `block_table`
+/// pointer stays `Ptr<i32>` (it's an integer indirection table, not a
+/// dtype-parametric tensor).
 #[triton_kernel]
-pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
-    q: Ptr<f32>,
-    k_block_pool: Ptr<f32>,
-    v_block_pool: Ptr<f32>,
+pub fn paged_decode_attention_typed<
+    T: TritonElem,
+    const HEAD_DIM: usize,
+    const BLOCK_KV: usize,
+>(
+    q: Ptr<T>,
+    k_block_pool: Ptr<T>,
+    v_block_pool: Ptr<T>,
     block_table: Ptr<i32>,
-    output: Ptr<f32>,
+    output: Ptr<T>,
     num_q_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -360,7 +400,8 @@ pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
     let dim_range = make_range(0, HEAD_DIM as i32);
     let dim_mask = dim_range < head_dim;
     let q_off = q_head * head_dim + dim_range;
-    let q_v = load(q + q_off, dim_mask);
+    let q_v_t = load(q + q_off, dim_mask);
+    let q_v = to_f32(q_v_t); // [HEAD_DIM] f32
 
     let m_init = const_f32(0.0_f32) - const_f32(1.0e30_f32);
     let l_init = const_f32(0.0_f32);
@@ -384,7 +425,7 @@ pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
             // physical_block id for adjacent slots).
             let logical_blocks = pos_range / block_size; // [BLOCK_KV]
             let slots = pos_range % block_size;          // [BLOCK_KV]
-            let physical_blocks = load(block_table + logical_blocks); // GATHER
+            let physical_blocks = load(block_table + logical_blocks); // GATHER (i32)
 
             // Per-position row base: physical * block_stride + slot * kv_stride + kv_head*head_dim
             let row_base = physical_blocks * block_stride + slots * kv_stride + kv_head * head_dim;
@@ -392,8 +433,10 @@ pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
             let col_2d = expand_dims(dim_range, 0);
             let kv_off_2d = row_base_2d + col_2d;
 
-            let k_block = load(k_block_pool + kv_off_2d);
-            let v_block = load(v_block_pool + kv_off_2d);
+            let k_block_t = load(k_block_pool + kv_off_2d);
+            let v_block_t = load(v_block_pool + kv_off_2d);
+            let k_block = to_f32(k_block_t);
+            let v_block = to_f32(v_block_t);
 
             let q_2d = expand_dims(q_v, 0);
             let qk = q_2d * k_block;
@@ -416,7 +459,8 @@ pub fn paged_decode_attention_f32<const HEAD_DIM: usize, const BLOCK_KV: usize>(
         },
     );
 
-    let out_v = acc / l_i;
+    let out_v_f32 = acc / l_i;
+    let out_v = as_t::<T>(out_v_f32);
     let out_off = q_head * head_dim + dim_range;
     store(output + out_off, out_v, dim_mask);
 }

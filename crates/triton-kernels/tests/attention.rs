@@ -4,11 +4,12 @@ use triton_kernels::prelude::*;
 
 #[test]
 fn decode_attention_emits_scf_for_with_three_iter_args() {
-    let text = decode_attention_f32::<128, 32>::mlir();
-    eprintln!("===== decode_attention_f32 =====\n{text}\n========================");
+    // f32 instantiation of the dtype-generic kernel.
+    let text = decode_attention_typed::<f32, 128, 32>::mlir();
+    eprintln!("===== decode_attention_typed (f32) =====\n{text}\n========================");
 
     assert!(
-        text.contains("tt.func @decode_attention_f32("),
+        text.contains("tt.func @decode_attention_typed("),
         "missing kernel func:\n{text}"
     );
 
@@ -52,13 +53,41 @@ fn decode_attention_emits_scf_for_with_three_iter_args() {
 
 #[test]
 fn decode_attention_hm_emits_kernel() {
-    let text = decode_attention_hm_f32::<128, 32>::mlir();
-    assert!(text.contains("tt.func @decode_attention_hm_f32("));
+    let text = decode_attention_hm_typed::<f32, 128, 32>::mlir();
+    assert!(text.contains("tt.func @decode_attention_hm_typed("));
     assert!(text.contains("\"scf.for\""));
     assert!(text.contains("\"math.exp\""));
     // Three loads minimum (Q + K + V); HM differs from canonical only in
     // address arithmetic so the op count signal is the same.
     assert!(text.matches("\"tt.load\"").count() >= 3);
+}
+
+#[test]
+fn decode_attention_hm_f16_uses_extf_truncf_chain_for_qkv_loads_and_store() {
+    // f16 instantiation of the dtype-generic head-major kernel —
+    // this is the variant ferrum's Llama path will load.
+    let text = decode_attention_hm_typed::<f16, 128, 32>::mlir();
+    eprintln!("===== decode_attention_hm_typed (f16) =====\n{text}\n========================");
+
+    // Q/K/V load: f16 → f32 via arith.extf (after the load, before compute).
+    assert!(
+        text.contains("\"arith.extf\""),
+        "f16 instantiation must contain extf for upcasting Q/K/V loads:\n{text}"
+    );
+    // Final downcast: f32 → f16 via arith.truncf (just before the store).
+    assert!(
+        text.contains("\"arith.truncf\""),
+        "f16 instantiation must contain truncf for downcasting acc → f16 store:\n{text}"
+    );
+    // Pointer params should be f16; tensor compute should still be f32.
+    let header = &text[..text.find(") {").unwrap()];
+    assert!(
+        header.matches("!tt.ptr<f16>").count() >= 4,
+        "f16 kernel header should have ≥4 f16 ptrs (Q/K/V/output):\n{header}"
+    );
+    // Distinct from f32 instantiation.
+    let f32_text = decode_attention_hm_typed::<f32, 128, 32>::mlir();
+    assert_ne!(text, f32_text, "f16 and f32 instantiations should differ");
 }
 
 #[test]
@@ -172,8 +201,8 @@ fn unified_attention_combines_paged_kv_block_table_with_causal_mask_loop() {
 
 #[test]
 fn paged_decode_attention_emits_block_table_gather() {
-    let text = paged_decode_attention_f32::<128, 32>::mlir();
-    assert!(text.contains("tt.func @paged_decode_attention_f32("));
+    let text = paged_decode_attention_typed::<f32, 128, 32>::mlir();
+    assert!(text.contains("tt.func @paged_decode_attention_typed("));
     // Address-translation needs divsi (logical = pos / block_size) + remsi
     // (slot = pos % block_size).
     assert!(text.contains("\"arith.divsi\""));
