@@ -113,14 +113,21 @@ fn unified_attention_f32<const HEAD_DIM: usize, const BLOCK_Q: usize, const BLOC
             let row_base_2d = expand_dims(row_base, 1);
             let kv_off_2d = row_base_2d + dim_2d;
 
-            let k_tile = load(k_cache_ptr + kv_off_2d);
+            // V keeps natural [BLOCK_KV, HEAD_DIM] layout for `dot(P, V)`.
             let v_tile = load(v_cache_ptr + kv_off_2d);
 
-            // scores = Q @ Kᵀ via broadcast-mul-reduce over HEAD_DIM.
-            let q_3d = expand_dims(q_tile, 1);
-            let k_3d = expand_dims(k_tile, 0);
-            let qk = q_3d * k_3d;
-            let scores_raw = reduce(qk, 2, |a, b| a + b);
+            // K loaded transposed [HEAD_DIM, BLOCK_KV] so `dot(Q, K_T)` is
+            // (BLOCK_Q, BLOCK_KV) directly. Same pointer scalars, swapped axes.
+            let dim_col_2d = expand_dims(dim_range, 1);
+            let row_base_row_2d = expand_dims(row_base, 0);
+            let k_off_t_2d = dim_col_2d + row_base_row_2d;
+            let k_tile_t = load(k_cache_ptr + k_off_t_2d);
+
+            // scores = Q · K_T via tt.dot (MMA hardware path).
+            let qk_zero_seed = splat_1d(const_f32(0.0_f32), 1);
+            let qk_zero_2d_seed = expand_dims(qk_zero_seed, 0);
+            let qk_acc = broadcast_2d(qk_zero_2d_seed, BLOCK_Q as i64, BLOCK_KV as i64);
+            let scores_raw = dot(q_tile, k_tile_t, qk_acc);
             let scores_scaled = scores_raw * sm_scale;
 
             // ── three-mask combination ──
@@ -142,13 +149,11 @@ fn unified_attention_f32<const HEAD_DIM: usize, const BLOCK_Q: usize, const BLOC
             let p = exp(masked_scores - expand_dims(m_ij, 1));
             let l_ij = reduce(p, 1, |a, b| a + b);
 
-            let p_3d = expand_dims(p, 2);
-            let v_3d = expand_dims(v_tile, 0);
-            let pv = p_3d * v_3d;
-            let pv_sum = reduce(pv, 1, |a, b| a + b);
-
+            // pv_sum + alpha-scaled previous acc folded into one tt.dot:
+            //   new_acc = dot(P, V, acc * alpha) = acc*alpha + P·V
             let alpha_2d = expand_dims(alpha, 1);
-            let new_acc = acc * alpha_2d + pv_sum;
+            let scaled_acc = acc * alpha_2d;
+            let new_acc = dot(p, v_tile, scaled_acc);
             let new_l_i = l_i * alpha + l_ij;
             (m_ij, new_l_i, new_acc)
         },
