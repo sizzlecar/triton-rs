@@ -209,11 +209,25 @@ pub fn fused_moe_w4a16_typed<
 }
 
 fn main() {
-    // Default config: f16 input/output, BM=16 (matches vLLM moe_block_size=16),
-    // BN=64, BK=32. This is the smallest-m variant — gates on prob_m
-    // boundaries.
-    print!(
-        "{}",
-        fused_moe_w4a16_typed::<f16, 16, 64, 32>::mlir()
-    );
+    // Default: BM=16, BN=64, BK=32. To emit a different tile, pass
+    // FERRUM_FUSED_MOE_TILE=BMxBNxBK as an env var, e.g.
+    //   FERRUM_FUSED_MOE_TILE=16x128x64 cargo run --example ...
+    let tile = std::env::var("FERRUM_FUSED_MOE_TILE")
+        .unwrap_or_else(|_| "16x64x32".to_string());
+    let mlir = match tile.as_str() {
+        "16x64x32" => fused_moe_w4a16_typed::<f16, 16, 64, 32>::mlir(),
+        "16x128x32" => fused_moe_w4a16_typed::<f16, 16, 128, 32>::mlir(),
+        "16x128x64" => fused_moe_w4a16_typed::<f16, 16, 128, 64>::mlir(),
+        "16x256x64" => fused_moe_w4a16_typed::<f16, 16, 256, 64>::mlir(),
+        "16x64x64" => fused_moe_w4a16_typed::<f16, 16, 64, 64>::mlir(),
+        "32x64x32" => fused_moe_w4a16_typed::<f16, 32, 64, 32>::mlir(),
+        "32x128x32" => fused_moe_w4a16_typed::<f16, 32, 128, 32>::mlir(),
+        "32x128x64" => fused_moe_w4a16_typed::<f16, 32, 128, 64>::mlir(),
+        "32x256x64" => fused_moe_w4a16_typed::<f16, 32, 256, 64>::mlir(),
+        "64x128x32" => fused_moe_w4a16_typed::<f16, 64, 128, 32>::mlir(),
+        "64x128x64" => fused_moe_w4a16_typed::<f16, 64, 128, 64>::mlir(),
+        "64x256x64" => fused_moe_w4a16_typed::<f16, 64, 256, 64>::mlir(),
+        _ => panic!("unknown tile {tile} — add to match arms"),
+    };
+    print!("{mlir}");
 }
